@@ -748,6 +748,7 @@ def write_timeseries_csv(rows: list[dict], output_csv: Path) -> None:
         "datetime",
         "date",
         "cloud_cover",
+        "tiff_path",
         "valid_pixels",
         "index_min",
         "index_p10",
@@ -795,6 +796,39 @@ def save_timeseries_plot(
     plt.close()
 
 
+def write_index_tiff(
+    output_tiff: Path,
+    index_array: np.ndarray,
+    transform: rasterio.Affine,
+    crs: CRS,
+    compress: str,
+) -> None:
+    """Write one index raster to GeoTIFF using float32 and explicit nodata."""
+    output_tiff.parent.mkdir(parents=True, exist_ok=True)
+
+    nodata_value = np.float32(-9999.0)
+    data = np.where(np.isfinite(index_array), index_array, nodata_value).astype("float32")
+    height, width = data.shape
+
+    with rasterio.open(
+        output_tiff,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=width,
+        count=1,
+        dtype="float32",
+        crs=crs,
+        transform=transform,
+        nodata=float(nodata_value),
+        compress=compress,
+        predictor=2,
+        tiled=True,
+        BIGTIFF="IF_SAFER",
+    ) as dst:
+        dst.write(data, 1)
+
+
 def sanitize_filename(text: str) -> str:
     allowed = {"-", "_"}
     chars = [char if (char.isalnum() or char in allowed) else "_" for char in text]
@@ -810,8 +844,21 @@ def build_output_prefix(config: AppConfig) -> str:
     return sanitize_filename(generated)
 
 
+def build_scene_tiff_path(
+    config: AppConfig,
+    item_id: str,
+    item_datetime: datetime | None,
+) -> Path:
+    date_part = item_datetime.date().isoformat() if item_datetime else "sin_fecha"
+    scene_part = sanitize_filename(item_id)
+    index_part = config.index_name.lower()
+    filename = f"{date_part}_{scene_part}_{index_part}.tif"
+    return config.index_tiff_dir / filename
+
+
 def process_candidate_items(
     candidate_items: list,
+    config: AppConfig,
     index_definition: IndexDefinition,
     cdse_access_token: str | None,
     geometries: list[dict],
@@ -832,7 +879,7 @@ def process_candidate_items(
         )
 
         try:
-            stats = compute_scene_index_stats(
+            scene_result = compute_scene_index_stats(
                 item=item,
                 index_definition=index_definition,
                 cdse_token=cdse_access_token,
@@ -861,13 +908,31 @@ def process_candidate_items(
             print(f"  Escena saltada por error no esperado: {err}")
             continue
 
+        tiff_path_text = ""
+        if config.export_index_tiff:
+            scene_tiff_path = build_scene_tiff_path(
+                config=config,
+                item_id=item.id,
+                item_datetime=item_dt,
+            )
+            write_index_tiff(
+                output_tiff=scene_tiff_path,
+                index_array=scene_result.index_array,
+                transform=scene_result.transform,
+                crs=scene_result.crs,
+                compress=config.tiff_compress,
+            )
+            tiff_path_text = str(scene_tiff_path.resolve())
+            print(f"  GeoTIFF guardado: {tiff_path_text}")
+
         rows.append(
             {
                 "scene_id": item.id,
                 "datetime": item_dt_text,
                 "date": item_dt.date().isoformat() if item_dt else "",
                 "cloud_cover": round(cloud_cover, 4),
-                **stats,
+                "tiff_path": tiff_path_text,
+                **scene_result.stats,
             }
         )
 
@@ -876,6 +941,7 @@ def process_candidate_items(
 
 def run_processing_with_rasterio_env(
     candidate_items: list,
+    config: AppConfig,
     index_definition: IndexDefinition,
     cdse_access_token: str | None,
     geometries: list[dict],
@@ -891,6 +957,7 @@ def run_processing_with_rasterio_env(
         with rasterio.Env(**env_options):
             return process_candidate_items(
                 candidate_items=candidate_items,
+                config=config,
                 index_definition=index_definition,
                 cdse_access_token=cdse_access_token,
                 geometries=geometries,
@@ -924,6 +991,7 @@ def run_processing_with_rasterio_env(
             with rasterio.Env(**env_options):
                 return process_candidate_items(
                     candidate_items=candidate_items,
+                    config=config,
                     index_definition=index_definition,
                     cdse_access_token=cdse_access_token,
                     geometries=geometries,
@@ -956,6 +1024,10 @@ def main() -> None:
     print(f"BBox AOI: {bbox}")
     print(f"Indice: {index_definition.name}")
     print(f"Bandas requeridas: {index_definition.required_bands}")
+    print(f"Exportar GeoTIFF: {config.export_index_tiff}")
+    if config.export_index_tiff:
+        print(f"Directorio GeoTIFF: {config.index_tiff_dir}")
+        print(f"Compresion GeoTIFF: {config.tiff_compress}")
 
     catalog = Client.open(config.stac_api_url)
     items = search_items_with_retry(
@@ -1010,6 +1082,7 @@ def main() -> None:
 
     rows, skipped = run_processing_with_rasterio_env(
         candidate_items=candidate_items,
+        config=config,
         index_definition=index_definition,
         cdse_access_token=cdse_access_token,
         geometries=geometries,
@@ -1043,6 +1116,8 @@ def main() -> None:
     print(f"- {config.index_name} maximo (global): {float(np.max(values)):.4f}")
     print(f"- CSV guardado en: {output_csv.resolve()}")
     print(f"- Grafica guardada en: {output_png.resolve()}")
+    if config.export_index_tiff:
+        print(f"- GeoTIFFs guardados en: {config.index_tiff_dir.resolve()}")
 
 
 if __name__ == "__main__":
