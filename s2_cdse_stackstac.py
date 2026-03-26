@@ -259,7 +259,7 @@ def build_config() -> S2Config:
         start_date=start_date,
         end_date=end_date,
         max_items=parse_int_env("MAX_ITEMS", default=500, min_value=1),
-        max_cloud_cover=parse_optional_float_env("S2_MAX_CLOUD_COVER", default=20.0),
+        max_cloud_cover=parse_optional_float_env("S2_MAX_CLOUD_COVER", default=None),
         requested_assets=requested_assets,
         index_name=index_name,
         apply_cloud_mask=parse_bool_env("S2_APPLY_CLOUD_MASK", True),
@@ -465,6 +465,11 @@ def main() -> None:
             f"Cloud mask SCL: asset={config.cloud_mask_asset} "
             f"clases={list(config.cloud_mask_scl_values)}"
         )
+        if config.max_cloud_cover is not None:
+            print(
+                "Aviso: S2_MAX_CLOUD_COVER esta activo junto con mascara SCL. "
+                "Puede dejar intervalos con cobertura parcial del AOI."
+            )
     print(f"stackstac rescale: {config.stackstac_rescale}")
     print(f"Exportar stack temporal: {config.export_temporal_stack}")
     print(f"Exportar compositos por intervalo: {config.export_interval_composites}")
