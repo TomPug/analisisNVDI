@@ -21,6 +21,7 @@ from typing import Callable
 
 import numpy as np
 from pystac_client import Client
+import rasterio
 from rasterio.enums import Resampling
 from rasterio.errors import RasterioIOError
 import stackstac
@@ -169,6 +170,8 @@ class S2Config:
     composite_method: str
     export_interval_composites: bool
     export_temporal_stack: bool
+    export_composite_stack: bool
+    delete_interval_composites_after_stack: bool
     output_epsg: int | None
     output_resolution: float
     chunksize: int
@@ -272,6 +275,11 @@ def build_config() -> S2Config:
         composite_method=os.getenv("S2_COMPOSITE_METHOD", "median").strip().lower(),
         export_interval_composites=parse_bool_env("S2_EXPORT_INTERVAL_COMPOSITES", True),
         export_temporal_stack=parse_bool_env("S2_EXPORT_TEMPORAL_STACK", True),
+        export_composite_stack=parse_bool_env("S2_EXPORT_COMPOSITE_STACK", True),
+        delete_interval_composites_after_stack=parse_bool_env(
+            "S2_DELETE_INTERVAL_COMPOSITES_AFTER_STACK",
+            True,
+        ),
         output_epsg=parse_optional_int_env("S2_OUTPUT_EPSG"),
         output_resolution=float(os.getenv("S2_OUTPUT_RESOLUTION_M", "20").strip()),
         chunksize=parse_int_env("S2_CHUNKSIZE", default=1024, min_value=128),
@@ -342,6 +350,75 @@ def _build_temporal_stack_path(output_dir: Path, output_prefix: str, token: str)
     safe_prefix = _sanitize_filename(output_prefix)
     safe_token = _sanitize_filename(token.lower())
     return output_dir / f"{safe_prefix}_{safe_token}_temporal_stack.tif"
+
+
+def _build_composite_stack_path(output_dir: Path, output_prefix: str, token: str) -> Path:
+    safe_prefix = _sanitize_filename(output_prefix)
+    safe_token = _sanitize_filename(token.lower())
+    return output_dir / f"{safe_prefix}_{safe_token}_composites_stack.tif"
+
+
+def _write_composite_stack_from_tiffs(
+    composite_tiffs: list[Path],
+    interval_tokens: list[str],
+    output_tiff: Path,
+    compress: str,
+) -> None:
+    if not composite_tiffs:
+        raise RuntimeError("No hay compuestos para construir el stack final.")
+    if len(composite_tiffs) != len(interval_tokens):
+        raise RuntimeError("La lista de compuestos e intervalos no coincide.")
+
+    output_tiff.parent.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(composite_tiffs[0]) as ref:
+        ref_height = ref.height
+        ref_width = ref.width
+        ref_transform = ref.transform
+        ref_crs = ref.crs
+        ref_dtype = ref.dtypes[0]
+        ref_nodata = ref.nodata
+
+    total_bands = 0
+    for path in composite_tiffs:
+        with rasterio.open(path) as src:
+            total_bands += src.count
+
+    with rasterio.open(
+        output_tiff,
+        "w",
+        driver="GTiff",
+        height=ref_height,
+        width=ref_width,
+        count=total_bands,
+        dtype=ref_dtype,
+        crs=ref_crs,
+        transform=ref_transform,
+        nodata=ref_nodata,
+        compress=compress,
+        predictor=2,
+        tiled=True,
+        BIGTIFF="IF_SAFER",
+    ) as dst:
+        out_band = 1
+        for path, interval_token in zip(composite_tiffs, interval_tokens):
+            with rasterio.open(path) as src:
+                if src.height != ref_height or src.width != ref_width:
+                    raise RuntimeError(f"Dimensiones incompatibles en {path}")
+                if src.transform != ref_transform:
+                    raise RuntimeError(f"Transform incompatible en {path}")
+                if src.crs != ref_crs:
+                    raise RuntimeError(f"CRS incompatible en {path}")
+
+                for band_index in range(1, src.count + 1):
+                    dst.write(src.read(band_index), out_band)
+                    src_desc = (src.descriptions[band_index - 1] or "").strip()
+                    if src_desc:
+                        label = f"{interval_token}_{src_desc}"
+                    else:
+                        label = f"{interval_token}_band{band_index}"
+                    dst.set_band_description(out_band, label)
+                    out_band += 1
 
 
 def _dedupe_keep_order(values: list[str]) -> list[str]:
@@ -473,6 +550,11 @@ def main() -> None:
     print(f"stackstac rescale: {config.stackstac_rescale}")
     print(f"Exportar stack temporal: {config.export_temporal_stack}")
     print(f"Exportar compositos por intervalo: {config.export_interval_composites}")
+    print(f"Exportar stack de compuestos: {config.export_composite_stack}")
+    print(
+        "Borrar compuestos intermedios tras stack: "
+        f"{config.delete_interval_composites_after_stack}"
+    )
     print(
         "S3 endpoint: "
         f"{(os.getenv('AWS_S3_ENDPOINT', CDSE_S3_ENDPOINT).strip() or CDSE_S3_ENDPOINT)}"
@@ -652,6 +734,8 @@ def main() -> None:
             print(f"Stack temporal exportado: {temporal_stack_path.resolve()}")
 
         manifest_rows: list[dict] = []
+        interval_tiff_paths: list[Path] = []
+        interval_tokens: list[str] = []
         intervals = build_intervals(config.start_date, config.end_date, config.interval_days)
         print(f"Intervalos temporales: {len(intervals)}")
 
@@ -684,11 +768,14 @@ def main() -> None:
                 n_scenes = int(window.sizes.get("time", 0))
                 n_items_by_date = _count_items_in_window(item_datetimes, start, end)
                 end_inclusive = end - timedelta(days=1)
+                interval_token = f"{start.strftime('%Y%m%d')}_{end_inclusive.strftime('%Y%m%d')}"
                 print(
                     f"[{idx}/{len(intervals)}] {start.date()} -> {end_inclusive.date()} | "
                     f"escenas stack={n_scenes} | items={n_items_by_date} | {output_tiff.name}"
                 )
 
+                interval_tiff_paths.append(output_tiff)
+                interval_tokens.append(interval_token)
                 manifest_rows.append(
                     {
                         "interval_start": start.strftime("%Y-%m-%d"),
@@ -709,9 +796,42 @@ def main() -> None:
                         "temporal_stack_tiff": str(temporal_stack_path.resolve())
                         if temporal_stack_path is not None
                         else "",
+                        "composite_stack_tiff": "",
+                        "interval_tiff_deleted": False,
                         "epsg": output_epsg,
                         "resolution_m": config.output_resolution,
                     }
+                )
+
+        composite_stack_path: Path | None = None
+        if config.export_composite_stack and interval_tiff_paths:
+            composite_stack_path = _build_composite_stack_path(
+                output_dir=config.output_dir,
+                output_prefix=config.output_prefix,
+                token=analysis_token,
+            )
+            _write_composite_stack_from_tiffs(
+                composite_tiffs=interval_tiff_paths,
+                interval_tokens=interval_tokens,
+                output_tiff=composite_stack_path,
+                compress=config.tiff_compress,
+            )
+            print(f"Stack de compuestos exportado: {composite_stack_path.resolve()}")
+
+            deleted_count = 0
+            if config.delete_interval_composites_after_stack:
+                for path in interval_tiff_paths:
+                    try:
+                        path.unlink(missing_ok=True)
+                        deleted_count += 1
+                    except OSError:
+                        pass
+                print(f"Compuestos intermedios eliminados: {deleted_count}")
+
+            for row in manifest_rows:
+                row["composite_stack_tiff"] = str(composite_stack_path.resolve())
+                row["interval_tiff_deleted"] = bool(
+                    config.delete_interval_composites_after_stack
                 )
 
         manifest_csv = config.output_dir / f"{_sanitize_filename(config.output_prefix)}_manifest.csv"
@@ -721,6 +841,8 @@ def main() -> None:
         print(f"- GeoTIFF por intervalo: {len(manifest_rows)}")
         if temporal_stack_path is not None:
             print(f"- Stack temporal: {temporal_stack_path.resolve()}")
+        if composite_stack_path is not None:
+            print(f"- Stack de compuestos: {composite_stack_path.resolve()}")
         print(f"- Carpeta salida: {config.output_dir.resolve()}")
         print(f"- Manifest CSV: {manifest_csv.resolve()}")
 

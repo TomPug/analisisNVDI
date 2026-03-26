@@ -72,6 +72,8 @@ Variables nuevas relevantes para S2:
 - `S2_CLOUD_MASK_SCL_CLASSES=3,8,9,10,11`
 - `S2_MAX_CLOUD_COVER=None` (recomendado si ya usas mascara SCL por pixel)
 - `S2_EXPORT_TEMPORAL_STACK=true`
+- `S2_EXPORT_COMPOSITE_STACK=true`
+- `S2_DELETE_INTERVAL_COMPOSITES_AFTER_STACK=true` (borra TIFF intermedios de intervalo y deja los 2 stacks)
 - `S2_LOCAL_ASSET_CACHE=false` (modo S3 directo recomendado)
 - `S2_CLEANUP_INTERMEDIATE_FILES=true`
 
