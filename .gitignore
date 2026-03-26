@@ -1,0 +1,5 @@
+.env
+*.tif
+*.csv
+*.shp
+*.gpkg
