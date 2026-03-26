@@ -115,6 +115,7 @@ def _compute_evi(bands: dict[str, xr.DataArray]) -> xr.DataArray:
     ).astype("float32")
 
 
+
 INDEX_DEFINITIONS: dict[str, IndexDefinition] = {
     "NDVI": IndexDefinition(
         name="NDVI",

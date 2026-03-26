@@ -1,7 +1,7 @@
 [project]
 name = "analisisnvdi"
 version = "0.1.0"
-description = "Add your description here"
+description = "Análisis de series temporales mediante datos de teledetección"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
