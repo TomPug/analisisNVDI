@@ -23,6 +23,7 @@ from pathlib import Path
 import sys
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 # Evita que GDAL intente cargar plugins externos de instalaciones ajenas
 # (habitual en Windows con "C:\\Program Files\\GDAL\\gdalplugins"), que pueden
@@ -630,6 +631,188 @@ def build_stackstac_gdal_env(access_token: str | None) -> LayeredEnv:
     return LayeredEnv(always=options)
 
 
+def _sanitize_path_token(text: str) -> str:
+    """Devuelve un token seguro para nombres de archivo/directorio."""
+    safe_chars = []
+    for char in text:
+        if char.isalnum() or char in {"-", "_", "."}:
+            safe_chars.append(char)
+        else:
+            safe_chars.append("_")
+    token = "".join(safe_chars).strip("._")
+    return token or "asset"
+
+
+def _is_http_href(href: str) -> bool:
+    """Indica si un href apunta a recurso HTTP/HTTPS remoto."""
+    lower = href.strip().lower()
+    return lower.startswith("http://") or lower.startswith("https://")
+
+
+def _guess_asset_suffix(href: str, fallback: str = ".bin") -> str:
+    """Intenta inferir extension de archivo desde la URL del asset."""
+    parsed = urlparse(href)
+    candidate = Path(parsed.path).name
+    if "." in candidate:
+        suffix = Path(candidate).suffix
+        if suffix:
+            return suffix
+    return fallback
+
+
+def _download_asset_with_retry(
+    session: requests.Session,
+    url: str,
+    target_path: Path,
+    timeout_sec: int,
+    max_attempts: int,
+    retry_base_delay_sec: float,
+) -> None:
+    """Descarga un asset remoto con reintentos y backoff exponencial."""
+    retryable_status = {429, 500, 502, 503, 504}
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_suffix(target_path.suffix + ".part")
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with session.get(url, stream=True, timeout=timeout_sec) as response:
+                status_code = response.status_code
+                if status_code in retryable_status:
+                    raise requests.HTTPError(
+                        f"HTTP {status_code}", response=response
+                    )
+                response.raise_for_status()
+
+                with temp_path.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+
+            temp_path.replace(target_path)
+            return
+        except Exception as exc:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = (
+                isinstance(exc, (requests.ConnectionError, requests.Timeout))
+                or status_code in retryable_status
+            )
+            if (not retryable) or attempt >= max_attempts:
+                raise
+
+            wait_seconds = retry_base_delay_sec * (2 ** (attempt - 1))
+            print(
+                f"Reintento descarga asset ({attempt}/{max_attempts}) en "
+                f"{wait_seconds:.1f}s | status={status_code or 'n/a'}"
+            )
+            time.sleep(wait_seconds)
+
+
+def cache_assets_locally(
+    items: list[dict],
+    asset_keys: list[str],
+    access_token: str | None,
+    cache_dir: Path,
+    force_refresh: bool = False,
+) -> list[dict]:
+    """Descarga assets remotos a cache local y actualiza href en items STAC.
+
+    Esta funcion resuelve fallos de lectura remota ``JP2`` en CDSE (por ejemplo
+    mensajes de tipo "Range downloading not supported by this server!") al
+    sustituir cada ``href`` HTTP por un archivo local descargado.
+
+    Args:
+        items: Items STAC normalizados como diccionarios.
+        asset_keys: Claves de asset a cachear (p. ej. ``["B02_10m", ...]``).
+        access_token: Token bearer para cabecera Authorization (opcional).
+        cache_dir: Directorio raiz del cache local.
+        force_refresh: Si ``True``, redescarga aunque el archivo ya exista.
+
+    Returns:
+        La misma lista de items, con ``href`` de assets apuntando a ruta local.
+    """
+    if not items or not asset_keys:
+        return items
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    timeout_sec = parse_int_env("STACKSTAC_ASSET_DOWNLOAD_TIMEOUT_SEC", default=300, min_value=30)
+    max_attempts = parse_int_env("STACKSTAC_ASSET_DOWNLOAD_MAX_ATTEMPTS", default=4, min_value=1)
+    retry_base_delay = parse_optional_float_env(
+        "STACKSTAC_ASSET_DOWNLOAD_RETRY_BASE_DELAY_SEC", default=2.0
+    )
+    if retry_base_delay is None or retry_base_delay <= 0:
+        raise ValueError("STACKSTAC_ASSET_DOWNLOAD_RETRY_BASE_DELAY_SEC debe ser > 0.")
+
+    total_assets = len(items) * len(asset_keys)
+    processed = 0
+    downloaded = 0
+    reused = 0
+
+    session = requests.Session()
+    if access_token:
+        session.headers.update({"Authorization": f"Bearer {access_token}"})
+
+    try:
+        for item in items:
+            item_id = str(item.get("id", "item"))
+            assets = item.get("assets", {})
+            if not isinstance(assets, dict):
+                continue
+
+            for asset_key in asset_keys:
+                processed += 1
+                asset = assets.get(asset_key)
+                if not isinstance(asset, dict):
+                    continue
+                href = asset.get("href")
+                if not isinstance(href, str) or not href.strip():
+                    continue
+
+                href = href.strip()
+                if not _is_http_href(href):
+                    continue
+
+                suffix = _guess_asset_suffix(href, fallback=".jp2")
+                filename = (
+                    f"{_sanitize_path_token(item_id)}__"
+                    f"{_sanitize_path_token(asset_key)}{suffix}"
+                )
+                local_path = cache_dir / filename
+
+                if local_path.exists() and local_path.stat().st_size > 0 and not force_refresh:
+                    asset["href"] = str(local_path.resolve())
+                    reused += 1
+                    continue
+
+                print(
+                    f"[cache {processed}/{total_assets}] Descargando "
+                    f"{item_id} | {asset_key}"
+                )
+                _download_asset_with_retry(
+                    session=session,
+                    url=href,
+                    target_path=local_path,
+                    timeout_sec=timeout_sec,
+                    max_attempts=max_attempts,
+                    retry_base_delay_sec=retry_base_delay,
+                )
+                asset["href"] = str(local_path.resolve())
+                downloaded += 1
+    finally:
+        session.close()
+
+    print(
+        "Cache local assets completado: "
+        f"total={total_assets}, descargados={downloaded}, reutilizados={reused}"
+    )
+    return items
+
+
 def build_intervals(start_date: str, end_date: str, interval_days: int) -> list[tuple[datetime, datetime]]:
     """Genera ventanas temporales semiabiertas [start, end) de longitud fija.
 
@@ -815,7 +998,49 @@ def write_multiband_geotiff(
     if "band" not in data.dims:
         raise RuntimeError("La salida para GeoTIFF debe tener dimension 'band'.")
 
-    values = data.transpose("band", "y", "x").astype("float32").values
+    values_da = data.transpose("band", "y", "x").astype("float32")
+
+    # CDSE puede responder 429 cuando se hacen muchas lecturas remotas a la vez.
+    # Se fuerza un numero bajo de workers y se reintenta con backoff exponencial.
+    dask_workers = parse_int_env("STACKSTAC_DASK_WORKERS", default=1, min_value=1)
+    max_attempts = parse_int_env("STACKSTAC_HTTP_MAX_ATTEMPTS", default=4, min_value=1)
+    retry_base_delay = parse_optional_float_env(
+        "STACKSTAC_HTTP_RETRY_BASE_DELAY_SEC", default=2.0
+    )
+    if retry_base_delay is None or retry_base_delay <= 0:
+        raise ValueError("STACKSTAC_HTTP_RETRY_BASE_DELAY_SEC debe ser > 0.")
+
+    values: np.ndarray | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            values = values_da.compute(
+                scheduler="threads",
+                num_workers=dask_workers,
+            ).values
+            break
+        except Exception as exc:
+            message = str(exc).lower()
+            is_retryable_http = (
+                "http response code: 429" in message
+                or "http response code: 500" in message
+                or "http response code: 502" in message
+                or "http response code: 503" in message
+                or "http response code: 504" in message
+            )
+            if (not is_retryable_http) or attempt >= max_attempts:
+                raise
+
+            wait_seconds = retry_base_delay * (2 ** (attempt - 1))
+            print(
+                f"Advertencia HTTP temporal al leer assets remotos "
+                f"(intento {attempt}/{max_attempts}). "
+                f"Reintentando en {wait_seconds:.1f}s..."
+            )
+            time.sleep(wait_seconds)
+
+    if values is None:
+        raise RuntimeError("No se pudo materializar el DataArray para exportar GeoTIFF.")
+
     values = np.where(np.isfinite(values), values, np.float32(nodata)).astype("float32")
 
     band_count, height, width = values.shape

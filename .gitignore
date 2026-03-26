@@ -1,5 +1,8 @@
 .env
 *.tif
+*.tif.aux.xml
 *.csv
 *.shp
 *.gpkg
+outputs/asset_cache/
+*.part

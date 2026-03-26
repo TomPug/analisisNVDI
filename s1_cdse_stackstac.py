@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 from pystac_client import Client
+from rasterio.errors import RasterioIOError
 from rasterio.enums import Resampling
 import stackstac
 import xarray as xr
@@ -31,6 +32,7 @@ from cdse_stackstac_common import (
     apply_aoi_mask,
     build_intervals,
     build_stackstac_gdal_env,
+    cache_assets_locally,
     get_cdse_access_token,
     get_item_datetime,
     guess_epsg,
@@ -78,6 +80,9 @@ class S1Config:
     output_resolution: float
     chunksize: int
     stackstac_rescale: bool
+    use_local_asset_cache: bool
+    asset_cache_dir: Path
+    asset_cache_force_refresh: bool
     output_dir: Path
     output_prefix: str
     tiff_compress: str
@@ -170,6 +175,13 @@ def build_config() -> S1Config:
         output_resolution=float(os.getenv("S1_OUTPUT_RESOLUTION_M", "20").strip()),
         chunksize=parse_int_env("S1_CHUNKSIZE", default=1024, min_value=128),
         stackstac_rescale=parse_bool_env("S1_STACKSTAC_RESCALE", False),
+        use_local_asset_cache=parse_bool_env("STACKSTAC_LOCAL_ASSET_CACHE", True),
+        asset_cache_dir=_to_abs_path(
+            os.getenv("STACKSTAC_ASSET_CACHE_DIR", "outputs/asset_cache").strip()
+        ),
+        asset_cache_force_refresh=parse_bool_env(
+            "STACKSTAC_ASSET_CACHE_FORCE_REFRESH", False
+        ),
         output_dir=output_dir,
         output_prefix=(os.getenv("S1_OUTPUT_PREFIX", "s1").strip() or "s1"),
         tiff_compress=(os.getenv("S1_TIFF_COMPRESS", "DEFLATE").strip() or "DEFLATE").upper(),
@@ -344,14 +356,28 @@ def main() -> None:
     asset_keys = [asset_mapping[name] for name in requested_assets]
     print(f"Assets resueltos: {asset_mapping}")
 
+    if config.use_local_asset_cache:
+        cache_dir = config.asset_cache_dir / "s1"
+        print(f"Cache local assets habilitado: {cache_dir}")
+        prepared_items = cache_assets_locally(
+            items=prepared_items,
+            asset_keys=asset_keys,
+            access_token=access_token,
+            cache_dir=cache_dir,
+            force_refresh=config.asset_cache_force_refresh,
+        )
+
     output_epsg = config.output_epsg or guess_epsg(prepared_items)
     if output_epsg is None:
         raise RuntimeError("No se pudo inferir EPSG. Define S1_OUTPUT_EPSG en .env.")
     print(f"EPSG salida: {output_epsg}")
 
     gdal_env = build_stackstac_gdal_env(access_token)
-    stack_dtype = np.float64 if config.stackstac_rescale else np.float32
-    stack_fill_value = np.float64(np.nan) if stack_dtype is np.float64 else np.float32(np.nan)
+    stack_dtype = np.dtype("float64" if config.stackstac_rescale else "float32")
+    stack_fill_value = stack_dtype.type(np.nan)
+    if not np.can_cast(type(stack_fill_value), stack_dtype):
+        stack_dtype = np.dtype("float64")
+        stack_fill_value = np.float64(np.nan)
     stack = stackstac.stack(
         prepared_items,
         assets=asset_keys,
@@ -369,6 +395,11 @@ def main() -> None:
         properties=False,
         band_coords=False,
         gdal_env=gdal_env,
+        errors_as_nodata=(
+            RasterioIOError("HTTP response code: 404"),
+            RasterioIOError(r"HTTP response code: (429|5\\d\\d)"),
+            RasterioIOError(r"Range downloading not supported by this server"),
+        ),
     ).assign_coords(band=("band", requested_assets))
 
     if config.to_db:
