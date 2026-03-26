@@ -661,18 +661,33 @@ def build_stackstac_gdal_env(
     aws_secret_access_key: str | None,
 ) -> LayeredEnv:
     """Construye entorno GDAL para lectura directa S3 en CDSE."""
+    if aws_access_key_id:
+        os.environ["AWS_ACCESS_KEY_ID"] = aws_access_key_id
+    if aws_secret_access_key:
+        os.environ["AWS_SECRET_ACCESS_KEY"] = aws_secret_access_key
+    if os.getenv("AWS_SESSION_TOKEN"):
+        os.environ["AWS_SESSION_TOKEN"] = os.getenv("AWS_SESSION_TOKEN", "").strip()
+
+    aws_endpoint = os.getenv("AWS_S3_ENDPOINT", CDSE_S3_ENDPOINT).strip() or CDSE_S3_ENDPOINT
+    aws_virtual_hosting = (
+        os.getenv("AWS_VIRTUAL_HOSTING", "FALSE").strip().upper() or "FALSE"
+    )
+    aws_https = os.getenv("AWS_HTTPS", "YES").strip().upper() or "YES"
+    aws_region = os.getenv("AWS_REGION", "us-east-1").strip() or "us-east-1"
+
+    # Rasterio limita algunas AWS_* en rio.Env; por compatibilidad con stackstac
+    # se fijan aqui como variables de entorno del proceso.
+    os.environ["AWS_S3_ENDPOINT"] = aws_endpoint
+    os.environ["AWS_VIRTUAL_HOSTING"] = aws_virtual_hosting
+    os.environ["AWS_HTTPS"] = aws_https
+    os.environ["AWS_REGION"] = aws_region
+
     options: dict[str, Any] = {
-        "AWS_S3_ENDPOINT": CDSE_S3_ENDPOINT,
-        "AWS_VIRTUAL_HOSTING": "FALSE",
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
         "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff,.jp2",
         "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
         "CPL_DEBUG": False,
     }
-    if aws_access_key_id:
-        options["AWS_ACCESS_KEY_ID"] = aws_access_key_id
-    if aws_secret_access_key:
-        options["AWS_SECRET_ACCESS_KEY"] = aws_secret_access_key
     return LayeredEnv(always=options)
 
 

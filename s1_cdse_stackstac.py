@@ -336,7 +336,10 @@ def main() -> None:
     print(f"Filtro orbita: {config.orbit_pass or 'ANY'}")
     print(f"Filtro modo instrumento: {config.instrument_mode or 'ANY'}")
     print(f"stackstac rescale: {config.stackstac_rescale}")
-    print(f"S3 endpoint: {CDSE_S3_ENDPOINT}")
+    print(
+        "S3 endpoint: "
+        f"{(os.getenv('AWS_S3_ENDPOINT', CDSE_S3_ENDPOINT).strip() or CDSE_S3_ENDPOINT)}"
+    )
     print(
         "Credenciales S3 configuradas: "
         f"{bool(config.aws_access_key_id and config.aws_secret_access_key)}"
