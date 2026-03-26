@@ -20,10 +20,12 @@ from datetime import datetime, timedelta
 import getpass
 import os
 from pathlib import Path
+import shutil
 import sys
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
+import re
 
 # Evita que GDAL intente cargar plugins externos de instalaciones ajenas
 # (habitual en Windows con "C:\\Program Files\\GDAL\\gdalplugins"), que pueden
@@ -56,6 +58,7 @@ CDSE_OIDC_TOKEN_URL_DEFAULT = (
     "protocol/openid-connect/token"
 )
 CDSE_CLIENT_ID_DEFAULT = "cdse-public"
+CDSE_S3_ENDPOINT = "eodata.dataspace.copernicus.eu"
 
 
 @dataclass(frozen=True)
@@ -466,29 +469,69 @@ def get_cloud_cover(item: Any) -> float:
     return float(props.get("eo:cloud_cover", props.get("cloudCover", 100.0)))
 
 
-def normalize_item_https(item: Any) -> dict:
-    """Normaliza assets para usar URLs HTTPS cuando existan alternates.
+def _zipper_href_to_s3_href(href: str) -> str | None:
+    """Convierte un href zipper OData a un href S3 best-effort.
 
-    CDSE puede devolver ``href`` en ``s3://``; stackstac/rasterio suele trabajar
-    mejor con ``https``. Esta funcion reemplaza cada ``asset['href']`` por su
-    alternativo HTTPS cuando esta disponible.
+    Nota: esta conversion es de respaldo. El camino preferido es usar
+    ``asset['alternate']['s3']['href']`` cuando exista.
+    """
+    lower = href.strip().lower()
+    if not (
+        lower.startswith("https://zipper.dataspace.copernicus.eu/")
+        or lower.startswith("http://zipper.dataspace.copernicus.eu/")
+    ):
+        return None
 
-    Args:
-        item: Item STAC como objeto o dict.
+    parsed = urlparse(href)
+    raw_nodes = re.findall(r"/Nodes\(([^)]+)\)", parsed.path)
+    if not raw_nodes:
+        return None
 
-    Returns:
-        Diccionario del item normalizado.
+    nodes: list[str] = []
+    for raw in raw_nodes:
+        text = unquote(raw.strip().strip("'\""))
+        if text:
+            nodes.append(text)
+    if not nodes:
+        return None
+
+    return f"s3://eodata/{'/'.join(nodes)}"
+
+
+def normalize_item_s3(item: Any) -> dict:
+    """Normaliza assets para priorizar href S3.
+
+    Orden de resolucion por asset:
+    1. ``alternate.s3.href``.
+    2. ``href`` actual si ya es ``s3://``.
+    3. Conversion best-effort desde URL zipper OData.
     """
     item_dict = item.to_dict() if hasattr(item, "to_dict") else dict(item)
     for asset in item_dict.get("assets", {}).values():
-        alternate = asset.get("alternate")
-        if not isinstance(alternate, dict):
+        if not isinstance(asset, dict):
             continue
-        https_alt = alternate.get("https")
-        if isinstance(https_alt, dict):
-            href = https_alt.get("href")
-            if isinstance(href, str) and href:
-                asset["href"] = href
+
+        resolved_href: str | None = None
+        alternate = asset.get("alternate")
+        if isinstance(alternate, dict):
+            s3_alt = alternate.get("s3")
+            if isinstance(s3_alt, dict):
+                href = s3_alt.get("href")
+                if isinstance(href, str) and href.strip():
+                    resolved_href = href.strip()
+
+        if resolved_href is None:
+            href = asset.get("href")
+            if isinstance(href, str) and href.strip():
+                href = href.strip()
+                if href.lower().startswith("s3://"):
+                    resolved_href = href
+                else:
+                    resolved_href = _zipper_href_to_s3_href(href)
+
+        if resolved_href:
+            asset["href"] = resolved_href
+
     return item_dict
 
 
@@ -500,6 +543,7 @@ ASSET_ALIAS_MAP: dict[str, tuple[str, ...]] = {
     "B8A": ("nir08",),
     "B11": ("swir16", "swir1"),
     "B12": ("swir22", "swir2"),
+    "SCL": ("scene_classification", "cloud_mask"),
     "VV": ("vv",),
     "VH": ("vh",),
     "HH": ("hh",),
@@ -523,6 +567,8 @@ def _asset_candidates(requested_asset: str) -> list[str]:
     candidates: list[str] = [req, req_upper, req.lower()]
 
     if req_upper.startswith("B"):
+        candidates.extend([f"{req_upper}_10m", f"{req_upper}_20m", f"{req_upper}_60m"])
+    elif "_" not in req_upper:
         candidates.extend([f"{req_upper}_10m", f"{req_upper}_20m", f"{req_upper}_60m"])
 
     for alias in ASSET_ALIAS_MAP.get(req_upper, ()):
@@ -610,24 +656,23 @@ def guess_epsg(items: list[dict]) -> int | None:
     return None
 
 
-def build_stackstac_gdal_env(access_token: str | None) -> LayeredEnv:
-    """Construye entorno GDAL para stackstac/rasterio.
-
-    Incluye opciones para rendimiento/estabilidad y, si existe token, inyecta
-    cabecera HTTP Authorization para acceso a assets privados/protegidos.
-
-    Args:
-        access_token: Token bearer CDSE opcional.
-
-    Returns:
-        ``LayeredEnv`` listo para pasar en ``stackstac.stack(..., gdal_env=...)``.
-    """
+def build_stackstac_gdal_env(
+    aws_access_key_id: str | None,
+    aws_secret_access_key: str | None,
+) -> LayeredEnv:
+    """Construye entorno GDAL para lectura directa S3 en CDSE."""
     options: dict[str, Any] = {
+        "AWS_S3_ENDPOINT": CDSE_S3_ENDPOINT,
+        "AWS_VIRTUAL_HOSTING": "FALSE",
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+        "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff,.jp2",
+        "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
         "CPL_DEBUG": False,
     }
-    if access_token:
-        options["GDAL_HTTP_HEADERS"] = f"Authorization: Bearer {access_token}"
+    if aws_access_key_id:
+        options["AWS_ACCESS_KEY_ID"] = aws_access_key_id
+    if aws_secret_access_key:
+        options["AWS_SECRET_ACCESS_KEY"] = aws_secret_access_key
     return LayeredEnv(always=options)
 
 
@@ -1002,7 +1047,7 @@ def write_multiband_geotiff(
 
     # CDSE puede responder 429 cuando se hacen muchas lecturas remotas a la vez.
     # Se fuerza un numero bajo de workers y se reintenta con backoff exponencial.
-    dask_workers = parse_int_env("STACKSTAC_DASK_WORKERS", default=1, min_value=1)
+    dask_workers = parse_int_env("STACKSTAC_DASK_WORKERS", default=4, min_value=1)
     max_attempts = parse_int_env("STACKSTAC_HTTP_MAX_ATTEMPTS", default=4, min_value=1)
     retry_base_delay = parse_optional_float_env(
         "STACKSTAC_HTTP_RETRY_BASE_DELAY_SEC", default=2.0
@@ -1087,3 +1132,10 @@ def write_csv(rows: list[dict[str, Any]], output_csv: Path) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def remove_directory(path: Path) -> None:
+    """Elimina un directorio completo si existe (ignora errores)."""
+    if not path.exists():
+        return
+    shutil.rmtree(path, ignore_errors=True)

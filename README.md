@@ -48,7 +48,7 @@ Si persiste, actualiza `rasterio/GDAL` en tu entorno virtual.
 
 Se añadieron dos scripts nuevos, equivalentes a tu flujo S1/S2 pero sobre STAC de Copernicus y usando `stackstac`:
 
-- `s2_cdse_stackstac.py`: Sentinel-2, compuestos temporales por intervalo y export GeoTIFF multibanda.
+- `s2_cdse_stackstac.py`: Sentinel-2, calculo de indice (NDVI/NDWI/NDBI/SAVI/EVI), mascara de nubes por pixel (SCL), stack temporal y compuestos por intervalo.
 - `s1_cdse_stackstac.py`: Sentinel-1, filtros de órbita/modo, opción dB y export GeoTIFF multibanda.
 
 Base compartida:
@@ -63,3 +63,20 @@ Ejecución:
 python s2_cdse_stackstac.py
 python s1_cdse_stackstac.py
 ```
+
+Variables nuevas relevantes para S2:
+
+- `S2_INDEX_NAME=NDVI` (`NDVI`, `NDWI`, `NDBI`, `SAVI`, `EVI`, `NONE`)
+- `S2_APPLY_CLOUD_MASK=true`
+- `S2_CLOUD_MASK_ASSET=SCL`
+- `S2_CLOUD_MASK_SCL_CLASSES=3,8,9,10,11`
+- `S2_EXPORT_TEMPORAL_STACK=true`
+- `S2_LOCAL_ASSET_CACHE=false` (modo S3 directo recomendado)
+- `S2_CLEANUP_INTERMEDIATE_FILES=true`
+
+Variables comunes para modo S3 directo (S1/S2):
+
+- `AWS_ACCESS_KEY_ID=...`
+- `AWS_SECRET_ACCESS_KEY=...`
+- `STACKSTAC_DASK_WORKERS=4`
+- `STACKSTAC_LOCAL_ASSET_CACHE=false`

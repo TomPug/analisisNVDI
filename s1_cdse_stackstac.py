@@ -28,6 +28,7 @@ from cdse_stackstac_common import (
     AOIInfo,
     CDSE_CLIENT_ID_DEFAULT,
     CDSE_OIDC_TOKEN_URL_DEFAULT,
+    CDSE_S3_ENDPOINT,
     STAC_API_URL_DEFAULT,
     apply_aoi_mask,
     build_intervals,
@@ -38,12 +39,13 @@ from cdse_stackstac_common import (
     guess_epsg,
     load_aoi_info,
     load_env_file,
-    normalize_item_https,
+    normalize_item_s3,
     parse_bool_env,
     parse_csv_env,
     parse_int_env,
     parse_optional_int_env,
     reduce_time_window,
+    remove_directory,
     resolve_requested_assets,
     search_items_with_retry,
     select_time_window,
@@ -83,6 +85,7 @@ class S1Config:
     use_local_asset_cache: bool
     asset_cache_dir: Path
     asset_cache_force_refresh: bool
+    cleanup_intermediate_files: bool
     output_dir: Path
     output_prefix: str
     tiff_compress: str
@@ -92,6 +95,8 @@ class S1Config:
     cdse_access_token: str | None
     cdse_username: str | None
     cdse_password: str | None
+    aws_access_key_id: str | None
+    aws_secret_access_key: str | None
     ask_credentials_in_terminal: bool
     cdse_oidc_token_url: str
     cdse_client_id: str
@@ -158,6 +163,10 @@ def build_config() -> S1Config:
     aoi_path = _to_abs_path(aoi_path_raw)
 
     output_dir = _to_abs_path(os.getenv("S1_OUTPUT_DIR", "outputs/s1_stackstac").strip())
+    use_local_asset_cache = parse_bool_env(
+        "S1_LOCAL_ASSET_CACHE",
+        parse_bool_env("STACKSTAC_LOCAL_ASSET_CACHE", False),
+    )
 
     return S1Config(
         stac_api_url=os.getenv("STAC_API_URL", STAC_API_URL_DEFAULT).strip(),
@@ -175,13 +184,14 @@ def build_config() -> S1Config:
         output_resolution=float(os.getenv("S1_OUTPUT_RESOLUTION_M", "20").strip()),
         chunksize=parse_int_env("S1_CHUNKSIZE", default=1024, min_value=128),
         stackstac_rescale=parse_bool_env("S1_STACKSTAC_RESCALE", False),
-        use_local_asset_cache=parse_bool_env("STACKSTAC_LOCAL_ASSET_CACHE", True),
+        use_local_asset_cache=use_local_asset_cache,
         asset_cache_dir=_to_abs_path(
             os.getenv("STACKSTAC_ASSET_CACHE_DIR", "outputs/asset_cache").strip()
         ),
         asset_cache_force_refresh=parse_bool_env(
             "STACKSTAC_ASSET_CACHE_FORCE_REFRESH", False
         ),
+        cleanup_intermediate_files=parse_bool_env("S1_CLEANUP_INTERMEDIATE_FILES", True),
         output_dir=output_dir,
         output_prefix=(os.getenv("S1_OUTPUT_PREFIX", "s1").strip() or "s1"),
         tiff_compress=(os.getenv("S1_TIFF_COMPRESS", "DEFLATE").strip() or "DEFLATE").upper(),
@@ -191,6 +201,8 @@ def build_config() -> S1Config:
         cdse_access_token=(os.getenv("CDSE_ACCESS_TOKEN", "").strip() or None),
         cdse_username=(os.getenv("CDSE_USERNAME", "").strip() or None),
         cdse_password=(os.getenv("CDSE_PASSWORD", "").strip() or None),
+        aws_access_key_id=(os.getenv("AWS_ACCESS_KEY_ID", "").strip() or None),
+        aws_secret_access_key=(os.getenv("AWS_SECRET_ACCESS_KEY", "").strip() or None),
         ask_credentials_in_terminal=parse_bool_env("ASK_CREDENTIALS_IN_TERMINAL", True),
         cdse_oidc_token_url=os.getenv("CDSE_OIDC_TOKEN_URL", CDSE_OIDC_TOKEN_URL_DEFAULT).strip(),
         cdse_client_id=os.getenv("CDSE_CLIENT_ID", CDSE_CLIENT_ID_DEFAULT).strip(),
@@ -245,7 +257,7 @@ def _build_output_tiff_path(
 
 def _item_orbit_value(item) -> str | None:
     """Extrae estado orbital desde diferentes claves STAC posibles."""
-    props = item.properties
+    props = item.properties if hasattr(item, "properties") else item.get("properties", {})
     for key in ("sat:orbit_state", "orbitDirection", "orbit_state", "s1:orbit_state"):
         value = props.get(key)
         if isinstance(value, str) and value.strip():
@@ -255,7 +267,7 @@ def _item_orbit_value(item) -> str | None:
 
 def _item_instrument_mode(item) -> str | None:
     """Extrae modo de instrumento SAR desde claves STAC posibles."""
-    props = item.properties
+    props = item.properties if hasattr(item, "properties") else item.get("properties", {})
     for key in ("sar:instrument_mode", "instrumentMode"):
         value = props.get(key)
         if isinstance(value, str) and value.strip():
@@ -324,6 +336,11 @@ def main() -> None:
     print(f"Filtro orbita: {config.orbit_pass or 'ANY'}")
     print(f"Filtro modo instrumento: {config.instrument_mode or 'ANY'}")
     print(f"stackstac rescale: {config.stackstac_rescale}")
+    print(f"S3 endpoint: {CDSE_S3_ENDPOINT}")
+    print(
+        "Credenciales S3 configuradas: "
+        f"{bool(config.aws_access_key_id and config.aws_secret_access_key)}"
+    )
 
     catalog = Client.open(config.stac_api_url)
     items = search_items_with_retry(
@@ -350,122 +367,152 @@ def main() -> None:
         if dt is not None
     ]
 
-    prepared_items = [normalize_item_https(item) for item in items]
+    prepared_items = [normalize_item_s3(item) for item in items]
     requested_assets = [asset.upper() for asset in config.requested_assets]
     asset_mapping = resolve_requested_assets(prepared_items, requested_assets)
     asset_keys = [asset_mapping[name] for name in requested_assets]
     print(f"Assets resueltos: {asset_mapping}")
 
-    if config.use_local_asset_cache:
-        cache_dir = config.asset_cache_dir / "s1"
-        print(f"Cache local assets habilitado: {cache_dir}")
-        prepared_items = cache_assets_locally(
-            items=prepared_items,
-            asset_keys=asset_keys,
-            access_token=access_token,
-            cache_dir=cache_dir,
-            force_refresh=config.asset_cache_force_refresh,
+    runtime_cache_dir: Path | None = None
+
+    try:
+        if config.use_local_asset_cache:
+            base_cache_dir = config.asset_cache_dir / "s1"
+            if config.cleanup_intermediate_files:
+                run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                runtime_cache_dir = base_cache_dir / f"run_{run_stamp}"
+                force_refresh = True
+                print(
+                    f"Descarga temporal assets (sin cache persistente): "
+                    f"{runtime_cache_dir}"
+                )
+            else:
+                runtime_cache_dir = base_cache_dir
+                force_refresh = config.asset_cache_force_refresh
+                print(f"Cache local assets habilitado: {runtime_cache_dir}")
+
+            prepared_items = cache_assets_locally(
+                items=prepared_items,
+                asset_keys=asset_keys,
+                access_token=access_token,
+                cache_dir=runtime_cache_dir,
+                force_refresh=force_refresh,
+            )
+        else:
+            print(
+                "Cache local assets: deshabilitado (modo S3). "
+                "Si falla acceso S3, revisa AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY "
+                "o usa S1_LOCAL_ASSET_CACHE=true como fallback."
+            )
+
+        output_epsg = config.output_epsg or guess_epsg(prepared_items)
+        if output_epsg is None:
+            raise RuntimeError("No se pudo inferir EPSG. Define S1_OUTPUT_EPSG en .env.")
+        print(f"EPSG salida: {output_epsg}")
+
+        gdal_env = build_stackstac_gdal_env(
+            aws_access_key_id=config.aws_access_key_id,
+            aws_secret_access_key=config.aws_secret_access_key,
         )
+        stack_dtype = np.dtype("float64" if config.stackstac_rescale else "float32")
+        stack_fill_value = stack_dtype.type(np.nan)
+        stack = stackstac.stack(
+            prepared_items,
+            assets=asset_keys,
+            epsg=output_epsg,
+            resolution=config.output_resolution,
+            bounds_latlon=aoi.bbox_latlon,
+            snap_bounds=True,
+            chunksize=config.chunksize,
+            dtype=stack_dtype,
+            fill_value=stack_fill_value,
+            rescale=config.stackstac_rescale,
+            sortby_date="asc",
+            xy_coords="center",
+            resampling=Resampling.nearest,
+            properties=False,
+            band_coords=False,
+            gdal_env=gdal_env,
+            errors_as_nodata=(
+                RasterioIOError("HTTP response code: 404"),
+                RasterioIOError(r"HTTP response code: (429|5\d\d)"),
+                RasterioIOError(r"Range downloading not supported by this server"),
+            ),
+        ).assign_coords(band=("band", requested_assets))
 
-    output_epsg = config.output_epsg or guess_epsg(prepared_items)
-    if output_epsg is None:
-        raise RuntimeError("No se pudo inferir EPSG. Define S1_OUTPUT_EPSG en .env.")
-    print(f"EPSG salida: {output_epsg}")
+        if config.to_db:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                stack = xr.where(stack > 0, 10.0 * np.log10(stack), np.nan).astype("float32")
 
-    gdal_env = build_stackstac_gdal_env(access_token)
-    stack_dtype = np.dtype("float64" if config.stackstac_rescale else "float32")
-    stack_fill_value = stack_dtype.type(np.nan)
-    if not np.can_cast(type(stack_fill_value), stack_dtype):
-        stack_dtype = np.dtype("float64")
-        stack_fill_value = np.float64(np.nan)
-    stack = stackstac.stack(
-        prepared_items,
-        assets=asset_keys,
-        epsg=output_epsg,
-        resolution=config.output_resolution,
-        bounds_latlon=aoi.bbox_latlon,
-        snap_bounds=True,
-        chunksize=config.chunksize,
-        dtype=stack_dtype,
-        fill_value=stack_fill_value,
-        rescale=config.stackstac_rescale,
-        sortby_date="asc",
-        xy_coords="center",
-        resampling=Resampling.nearest,
-        properties=False,
-        band_coords=False,
-        gdal_env=gdal_env,
-        errors_as_nodata=(
-            RasterioIOError("HTTP response code: 404"),
-            RasterioIOError(r"HTTP response code: (429|5\\d\\d)"),
-            RasterioIOError(r"Range downloading not supported by this server"),
-        ),
-    ).assign_coords(band=("band", requested_assets))
+        if config.apply_aoi_mask:
+            stack = apply_aoi_mask(stack, aoi, output_epsg)
 
-    if config.to_db:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            stack = xr.where(stack > 0, 10.0 * np.log10(stack), np.nan).astype("float32")
+        intervals = build_intervals(config.start_date, config.end_date, config.interval_days)
+        print(f"Intervalos temporales: {len(intervals)}")
 
-    if config.apply_aoi_mask:
-        stack = apply_aoi_mask(stack, aoi, output_epsg)
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        manifest_rows: list[dict] = []
 
-    intervals = build_intervals(config.start_date, config.end_date, config.interval_days)
-    print(f"Intervalos temporales: {len(intervals)}")
+        for idx, (start, end) in enumerate(intervals, start=1):
+            window = select_time_window(stack, start, end)
+            if window is None:
+                continue
 
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    manifest_rows: list[dict] = []
+            composite = reduce_time_window(window, config.composite_method)
+            output_tiff = _build_output_tiff_path(
+                output_dir=config.output_dir,
+                prefix=config.output_prefix,
+                start=start,
+                end=end,
+            )
+            write_multiband_geotiff(
+                output_tiff=output_tiff,
+                data=composite,
+                output_epsg=output_epsg,
+                compress=config.tiff_compress,
+            )
 
-    for idx, (start, end) in enumerate(intervals, start=1):
-        window = select_time_window(stack, start, end)
-        if window is None:
-            continue
+            n_scenes = int(window.sizes.get("time", 0))
+            n_items_by_date = _count_items_in_window(item_datetimes, start, end)
+            end_inclusive = end - timedelta(days=1)
+            print(
+                f"[{idx}/{len(intervals)}] {start.date()} -> {end_inclusive.date()} | "
+                f"escenas stack={n_scenes} | items={n_items_by_date} | {output_tiff.name}"
+            )
 
-        composite = reduce_time_window(window, config.composite_method)
-        output_tiff = _build_output_tiff_path(
-            output_dir=config.output_dir,
-            prefix=config.output_prefix,
-            start=start,
-            end=end,
-        )
-        write_multiband_geotiff(
-            output_tiff=output_tiff,
-            data=composite,
-            output_epsg=output_epsg,
-            compress=config.tiff_compress,
-        )
+            manifest_rows.append(
+                {
+                    "interval_start": start.strftime("%Y-%m-%d"),
+                    "interval_end_exclusive": end.strftime("%Y-%m-%d"),
+                    "stack_scene_count": n_scenes,
+                    "item_count": n_items_by_date,
+                    "output_tiff": str(output_tiff.resolve()),
+                    "polarizations": ",".join(requested_assets),
+                    "method": config.composite_method,
+                    "to_db": config.to_db,
+                    "orbit_pass": config.orbit_pass or "ANY",
+                    "instrument_mode": config.instrument_mode or "ANY",
+                    "epsg": output_epsg,
+                    "resolution_m": config.output_resolution,
+                }
+            )
 
-        n_scenes = int(window.sizes.get("time", 0))
-        n_items_by_date = _count_items_in_window(item_datetimes, start, end)
-        end_inclusive = end - timedelta(days=1)
-        print(
-            f"[{idx}/{len(intervals)}] {start.date()} -> {end_inclusive.date()} | "
-            f"escenas stack={n_scenes} | items={n_items_by_date} | {output_tiff.name}"
-        )
+        manifest_csv = config.output_dir / f"{_sanitize_filename(config.output_prefix)}_manifest.csv"
+        write_csv(manifest_rows, manifest_csv)
 
-        manifest_rows.append(
-            {
-                "interval_start": start.strftime("%Y-%m-%d"),
-                "interval_end_exclusive": end.strftime("%Y-%m-%d"),
-                "stack_scene_count": n_scenes,
-                "item_count": n_items_by_date,
-                "output_tiff": str(output_tiff.resolve()),
-                "polarizations": ",".join(requested_assets),
-                "method": config.composite_method,
-                "to_db": config.to_db,
-                "orbit_pass": config.orbit_pass or "ANY",
-                "instrument_mode": config.instrument_mode or "ANY",
-                "epsg": output_epsg,
-                "resolution_m": config.output_resolution,
-            }
-        )
+        print("\nProceso S1 completado.")
+        print(f"- GeoTIFF generados: {len(manifest_rows)}")
+        print(f"- Carpeta salida: {config.output_dir.resolve()}")
+        print(f"- Manifest CSV: {manifest_csv.resolve()}")
 
-    manifest_csv = config.output_dir / f"{_sanitize_filename(config.output_prefix)}_manifest.csv"
-    write_csv(manifest_rows, manifest_csv)
-
-    print("\nProceso S1 completado.")
-    print(f"- GeoTIFF generados: {len(manifest_rows)}")
-    print(f"- Carpeta salida: {config.output_dir.resolve()}")
-    print(f"- Manifest CSV: {manifest_csv.resolve()}")
+    finally:
+        if (
+            runtime_cache_dir is not None
+            and config.use_local_asset_cache
+            and config.cleanup_intermediate_files
+        ):
+            remove_directory(runtime_cache_dir)
+            print(f"Intermedios eliminados: {runtime_cache_dir}")
 
 
 if __name__ == "__main__":
