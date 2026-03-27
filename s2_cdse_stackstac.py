@@ -13,11 +13,12 @@ Este script:
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
-from typing import Callable
+import tomllib
 
 import numpy as np
 from pystac_client import Client
@@ -62,6 +63,7 @@ from cdse_stackstac_common import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ENV_PATH = SCRIPT_DIR / ".env"
+DEFAULT_INDEX_DEFINITIONS_PATH = SCRIPT_DIR / "s2_index_definitions.toml"
 DEFAULT_SCL_MASK_VALUES = (3, 8, 9, 10, 11)
 
 
@@ -71,7 +73,7 @@ class IndexDefinition:
 
     name: str
     required_assets: tuple[str, ...]
-    compute: Callable[[dict[str, xr.DataArray]], xr.DataArray]
+    formula: str
     clip_range: tuple[float, float] | None = None
 
 
@@ -80,75 +82,223 @@ def _normalized_difference(a: xr.DataArray, b: xr.DataArray) -> xr.DataArray:
     return xr.where(denom != 0, (a - b) / denom, np.nan).astype("float32")
 
 
-def _compute_ndvi(bands: dict[str, xr.DataArray]) -> xr.DataArray:
-    return _normalized_difference(bands["B08"], bands["B04"])
+def _safe_divide(numerator: xr.DataArray, denominator: xr.DataArray) -> xr.DataArray:
+    return xr.where(denominator != 0, numerator / denominator, np.nan).astype("float32")
 
 
-def _compute_ndwi(bands: dict[str, xr.DataArray]) -> xr.DataArray:
-    return _normalized_difference(bands["B03"], bands["B08"])
-
-
-def _compute_ndbi(bands: dict[str, xr.DataArray]) -> xr.DataArray:
-    return _normalized_difference(bands["B11"], bands["B08"])
-
-
-def _compute_savi(bands: dict[str, xr.DataArray]) -> xr.DataArray:
-    nir = bands["B08"]
-    red = bands["B04"]
-    l_factor = 0.5
-    denom = nir + red + l_factor
-    return xr.where(
-        denom != 0,
-        ((nir - red) / denom) * (1 + l_factor),
-        np.nan,
-    ).astype("float32")
-
-
-def _compute_evi(bands: dict[str, xr.DataArray]) -> xr.DataArray:
-    nir = bands["B08"]
-    red = bands["B04"]
-    blue = bands["B02"]
-    denom = nir + 6.0 * red - 7.5 * blue + 1.0
-    return xr.where(
-        denom != 0,
-        2.5 * (nir - red) / denom,
-        np.nan,
-    ).astype("float32")
-
-
-
-INDEX_DEFINITIONS: dict[str, IndexDefinition] = {
-    "NDVI": IndexDefinition(
-        name="NDVI",
-        required_assets=("B08", "B04"),
-        compute=_compute_ndvi,
-        clip_range=(-1.0, 1.0),
-    ),
-    "NDWI": IndexDefinition(
-        name="NDWI",
-        required_assets=("B03", "B08"),
-        compute=_compute_ndwi,
-        clip_range=(-1.0, 1.0),
-    ),
-    "NDBI": IndexDefinition(
-        name="NDBI",
-        required_assets=("B11", "B08"),
-        compute=_compute_ndbi,
-        clip_range=(-1.0, 1.0),
-    ),
-    "SAVI": IndexDefinition(
-        name="SAVI",
-        required_assets=("B08", "B04"),
-        compute=_compute_savi,
-        clip_range=(-1.0, 1.0),
-    ),
-    "EVI": IndexDefinition(
-        name="EVI",
-        required_assets=("B08", "B04", "B02"),
-        compute=_compute_evi,
-        clip_range=None,
-    ),
+FORMULA_FUNCTIONS = {
+    "nd": _normalized_difference,
+    "safe_div": _safe_divide,
+    "abs": np.abs,
+    "sqrt": np.sqrt,
+    "log": np.log,
+    "exp": np.exp,
+    "minimum": np.minimum,
+    "maximum": np.maximum,
 }
+
+FORMULA_CONSTANTS = {
+    "PI": float(np.pi),
+    "E": float(np.e),
+}
+
+ALLOWED_FORMULA_AST_NODES = (
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Call,
+    ast.Name,
+    ast.Load,
+    ast.Constant,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.Pow,
+    ast.Mod,
+    ast.UAdd,
+    ast.USub,
+)
+
+
+def _extract_formula_assets(expression_ast: ast.AST) -> list[str]:
+    assets: list[str] = []
+    for node in ast.walk(expression_ast):
+        if not isinstance(node, ast.Name):
+            continue
+        if node.id in FORMULA_FUNCTIONS or node.id in FORMULA_CONSTANTS:
+            continue
+        if node.id not in assets:
+            assets.append(node.id)
+    return assets
+
+
+def _validate_formula_ast(
+    expression_ast: ast.AST,
+    allowed_band_names: set[str],
+    index_name: str,
+) -> None:
+    allowed_names = set(allowed_band_names) | set(FORMULA_FUNCTIONS.keys()) | set(
+        FORMULA_CONSTANTS.keys()
+    )
+    for node in ast.walk(expression_ast):
+        if not isinstance(node, ALLOWED_FORMULA_AST_NODES):
+            raise ValueError(
+                f"Formula no permitida en indice {index_name}: "
+                f"token {type(node).__name__}."
+            )
+        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
+            raise ValueError(
+                f"Constante no numerica en formula del indice {index_name}: {node.value!r}."
+            )
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in FORMULA_FUNCTIONS:
+                valid_functions = ", ".join(sorted(FORMULA_FUNCTIONS.keys()))
+                raise ValueError(
+                    f"Funcion no permitida en formula del indice {index_name}. "
+                    f"Funciones validas: {valid_functions}."
+                )
+            if node.keywords:
+                raise ValueError(
+                    f"La formula del indice {index_name} no admite argumentos nombrados."
+                )
+        if isinstance(node, ast.Name) and node.id not in allowed_names:
+            valid_bands = ", ".join(sorted(allowed_band_names))
+            raise ValueError(
+                f"Variable no permitida en formula del indice {index_name}: {node.id}. "
+                f"Bandas permitidas: {valid_bands}."
+            )
+
+
+def _parse_clip_range(raw_value: object, index_name: str) -> tuple[float, float] | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, list) or len(raw_value) != 2:
+        raise ValueError(
+            f"indices.{index_name}.clip_range debe ser [min, max] o no estar definido."
+        )
+    min_value_raw, max_value_raw = raw_value
+    try:
+        min_value = float(min_value_raw)
+        max_value = float(max_value_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"indices.{index_name}.clip_range debe tener valores numericos."
+        ) from exc
+    if min_value > max_value:
+        raise ValueError(
+            f"indices.{index_name}.clip_range invalido: min > max ({min_value} > {max_value})."
+        )
+    return (min_value, max_value)
+
+
+def _load_index_definitions(index_file: Path) -> dict[str, IndexDefinition]:
+    if not index_file.exists():
+        raise FileNotFoundError(
+            f"No existe el archivo de indices: {index_file}. "
+            "Define S2_INDEX_DEFINITIONS_FILE o crea el archivo por defecto."
+        )
+
+    try:
+        with index_file.open("rb") as handle:
+            payload = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(
+            f"Formato TOML invalido en archivo de indices {index_file}: {exc}."
+        ) from exc
+
+    raw_indices = payload.get("indices")
+    if not isinstance(raw_indices, dict) or not raw_indices:
+        raise ValueError(
+            f"Archivo de indices invalido: {index_file}. "
+            "Debe incluir al menos una entrada en [indices]."
+        )
+
+    definitions: dict[str, IndexDefinition] = {}
+    for raw_name, raw_definition in raw_indices.items():
+        index_name = str(raw_name).strip().upper()
+        if not index_name:
+            raise ValueError(f"Nombre de indice vacio en {index_file}.")
+        if not isinstance(raw_definition, dict):
+            raise ValueError(
+                f"Definicion invalida para indice {index_name}: se esperaba una tabla TOML."
+            )
+
+        formula_raw = raw_definition.get("formula")
+        if not isinstance(formula_raw, str) or not formula_raw.strip():
+            raise ValueError(f"Indice {index_name} debe definir formula no vacia.")
+        formula = formula_raw.strip()
+
+        try:
+            expression_ast = ast.parse(formula, mode="eval")
+        except SyntaxError as exc:
+            raise ValueError(
+                f"Formula invalida en indice {index_name}: {exc.msg}."
+            ) from exc
+
+        required_assets_raw = raw_definition.get("required_assets")
+        if required_assets_raw is None:
+            required_assets = _dedupe_keep_order(
+                [asset.upper() for asset in _extract_formula_assets(expression_ast)]
+            )
+        elif isinstance(required_assets_raw, list):
+            required_assets = _dedupe_keep_order(
+                [str(asset).strip().upper() for asset in required_assets_raw if str(asset).strip()]
+            )
+        else:
+            raise ValueError(
+                f"indices.{index_name}.required_assets debe ser lista de strings."
+            )
+        if not required_assets:
+            raise ValueError(
+                f"Indice {index_name} debe definir required_assets o usar bandas en la formula."
+            )
+
+        _validate_formula_ast(expression_ast, set(required_assets), index_name)
+        clip_range = _parse_clip_range(raw_definition.get("clip_range"), index_name)
+        definitions[index_name] = IndexDefinition(
+            name=index_name,
+            required_assets=tuple(required_assets),
+            formula=formula,
+            clip_range=clip_range,
+        )
+
+    return definitions
+
+
+def _evaluate_formula(
+    formula: str,
+    bands: dict[str, xr.DataArray],
+    index_name: str,
+) -> xr.DataArray:
+    try:
+        expression_ast = ast.parse(formula, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(
+            f"Formula invalida en indice {index_name}: {exc.msg}."
+        ) from exc
+    _validate_formula_ast(expression_ast, set(bands.keys()), index_name)
+
+    evaluation_context: dict[str, object] = {}
+    evaluation_context.update(FORMULA_CONSTANTS)
+    evaluation_context.update(FORMULA_FUNCTIONS)
+    evaluation_context.update(bands)
+    try:
+        result = eval(
+            compile(expression_ast, "<s2_index_formula>", "eval"),
+            {"__builtins__": {}},
+            evaluation_context,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Error evaluando formula del indice {index_name}: {exc}."
+        ) from exc
+
+    if not isinstance(result, xr.DataArray):
+        raise ValueError(
+            f"La formula del indice {index_name} no devolvio un raster (xarray.DataArray)."
+        )
+    return result.where(np.isfinite(result)).astype("float32")
 
 
 @dataclass(frozen=True)
@@ -163,6 +313,7 @@ class S2Config:
     max_cloud_cover: float | None
     requested_assets: list[str]
     index_name: str
+    index_definitions_file: Path
     apply_cloud_mask: bool
     cloud_mask_asset: str
     cloud_mask_scl_values: tuple[int, ...]
@@ -217,14 +368,7 @@ def _parse_int_csv_env(name: str, default_csv: str) -> tuple[int, ...]:
 
 def _normalize_index_name(value: str) -> str:
     text = value.strip().upper()
-    if not text:
-        return "NDVI"
-    if text == "NONE":
-        return "NONE"
-    if text not in INDEX_DEFINITIONS:
-        valid = ", ".join(sorted(INDEX_DEFINITIONS.keys()))
-        raise ValueError(f"S2_INDEX_NAME invalido: {text}. Valores validos: {valid}, NONE.")
-    return text
+    return text or "NDVI"
 
 
 def build_config() -> S2Config:
@@ -251,6 +395,12 @@ def build_config() -> S2Config:
     output_dir = _to_abs_path(os.getenv("S2_OUTPUT_DIR", "outputs/s2_stackstac").strip())
     requested_assets = [asset.upper() for asset in parse_csv_env("S2_BANDS", "B02,B03,B04,B08")]
     index_name = _normalize_index_name(os.getenv("S2_INDEX_NAME", "NDVI"))
+    index_definitions_file = _to_abs_path(
+        (
+            os.getenv("S2_INDEX_DEFINITIONS_FILE", str(DEFAULT_INDEX_DEFINITIONS_PATH)).strip()
+            or str(DEFAULT_INDEX_DEFINITIONS_PATH)
+        )
+    )
     use_local_asset_cache = parse_bool_env(
         "S2_LOCAL_ASSET_CACHE",
         parse_bool_env("STACKSTAC_LOCAL_ASSET_CACHE", False),
@@ -265,6 +415,7 @@ def build_config() -> S2Config:
         max_cloud_cover=parse_optional_float_env("S2_MAX_CLOUD_COVER", default=None),
         requested_assets=requested_assets,
         index_name=index_name,
+        index_definitions_file=index_definitions_file,
         apply_cloud_mask=parse_bool_env("S2_APPLY_CLOUD_MASK", True),
         cloud_mask_asset=(os.getenv("S2_CLOUD_MASK_ASSET", "SCL").strip() or "SCL").upper(),
         cloud_mask_scl_values=_parse_int_csv_env(
@@ -432,14 +583,33 @@ def _dedupe_keep_order(values: list[str]) -> list[str]:
     return ordered
 
 
-def _resolve_processing_assets(config: S2Config) -> list[str]:
-    if config.index_name == "NONE":
+def _resolve_processing_assets(
+    config: S2Config,
+    index_definition: IndexDefinition | None,
+) -> list[str]:
+    if index_definition is None:
         assets = list(config.requested_assets)
     else:
-        assets = list(INDEX_DEFINITIONS[config.index_name].required_assets)
+        assets = list(index_definition.required_assets)
     if config.apply_cloud_mask:
         assets.append(config.cloud_mask_asset)
     return _dedupe_keep_order([asset.upper() for asset in assets])
+
+
+def _resolve_index_definition(
+    config: S2Config,
+) -> IndexDefinition | None:
+    if config.index_name == "NONE":
+        return None
+    index_definitions = _load_index_definitions(config.index_definitions_file)
+    selected = index_definitions.get(config.index_name)
+    if selected is None:
+        valid = ", ".join(sorted(index_definitions.keys()))
+        raise ValueError(
+            f"S2_INDEX_NAME invalido: {config.index_name}. "
+            f"Valores validos en {config.index_definitions_file.name}: {valid}, NONE."
+        )
+    return selected
 
 
 def _apply_scl_cloud_mask(
@@ -465,7 +635,7 @@ def _compute_index_series(
         asset: stack.sel(band=asset).astype("float32")
         for asset in index_definition.required_assets
     }
-    index = index_definition.compute(bands)
+    index = _evaluate_formula(index_definition.formula, bands, index_definition.name)
     if index_definition.clip_range is not None:
         min_value, max_value = index_definition.clip_range
         index = index.clip(min=min_value, max=max_value)
@@ -512,9 +682,7 @@ def main() -> None:
     if config.output_resolution <= 0:
         raise ValueError("S2_OUTPUT_RESOLUTION_M debe ser > 0.")
 
-    index_definition = None
-    if config.index_name != "NONE":
-        index_definition = INDEX_DEFINITIONS[config.index_name]
+    index_definition = _resolve_index_definition(config)
 
     access_token = get_cdse_access_token(
         access_token=config.cdse_access_token,
@@ -531,11 +699,14 @@ def main() -> None:
         print(f"Capa AOI: {aoi.layer}")
     print(f"BBox lat/lon: {aoi.bbox_latlon}")
     print(f"Coleccion S2: {config.collection}")
+    if index_definition is not None:
+        print(f"Archivo indices: {config.index_definitions_file}")
     print(f"Indice S2: {config.index_name}")
     if index_definition is None:
         print(f"Bandas pedidas: {config.requested_assets}")
     else:
         print(f"Bandas del indice: {list(index_definition.required_assets)}")
+        print(f"Formula indice: {index_definition.formula}")
     print(f"Aplicar mascara de nubes: {config.apply_cloud_mask}")
     if config.apply_cloud_mask:
         print(
@@ -591,7 +762,7 @@ def main() -> None:
     ]
 
     prepared_items = [normalize_item_s3(item) for item in items]
-    processing_assets = _resolve_processing_assets(config)
+    processing_assets = _resolve_processing_assets(config, index_definition)
     asset_mapping = resolve_requested_assets(prepared_items, processing_assets)
     asset_key_by_name = {name: asset_mapping[name] for name in processing_assets}
     print(f"Assets logicos: {processing_assets}")

@@ -66,7 +66,8 @@ python s1_cdse_stackstac.py
 
 Variables nuevas relevantes para S2:
 
-- `S2_INDEX_NAME=NDVI` (`NDVI`, `NDWI`, `NDBI`, `SAVI`, `EVI`, `NONE`)
+- `S2_INDEX_NAME=NDVI` (nombre del indice en `s2_index_definitions.toml`, o `NONE`)
+- `S2_INDEX_DEFINITIONS_FILE=s2_index_definitions.toml`
 - `S2_APPLY_CLOUD_MASK=true`
 - `S2_CLOUD_MASK_ASSET=SCL`
 - `S2_CLOUD_MASK_SCL_CLASSES=3,8,9,10,11`
@@ -76,6 +77,15 @@ Variables nuevas relevantes para S2:
 - `S2_DELETE_INTERVAL_COMPOSITES_AFTER_STACK=true` (borra TIFF intermedios de intervalo y deja los 2 stacks)
 - `S2_LOCAL_ASSET_CACHE=false` (modo S3 directo recomendado)
 - `S2_CLEANUP_INTERMEDIATE_FILES=true`
+
+Definiciones de indices en archivo externo (`s2_index_definitions.toml`):
+
+```toml
+[indices.NDRE]
+required_assets = ["B08", "B05"]
+formula = "nd(B08, B05)"
+clip_range = [-1.0, 1.0]
+```
 
 Variables comunes para modo S3 directo (S1/S2):
 

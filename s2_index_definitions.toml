@@ -1,0 +1,24 @@
+[indices.NDVI]
+required_assets = ["B08", "B04"]
+formula = "nd(B08, B04)"
+clip_range = [-1.0, 1.0]
+
+[indices.NDWI]
+required_assets = ["B03", "B08"]
+formula = "nd(B03, B08)"
+clip_range = [-1.0, 1.0]
+
+[indices.NDBI]
+required_assets = ["B11", "B08"]
+formula = "nd(B11, B08)"
+clip_range = [-1.0, 1.0]
+
+[indices.SAVI]
+required_assets = ["B08", "B04"]
+formula = "safe_div(1.5 * (B08 - B04), B08 + B04 + 0.5)"
+clip_range = [-1.0, 1.0]
+
+[indices.EVI]
+required_assets = ["B08", "B04", "B02"]
+formula = "safe_div(2.5 * (B08 - B04), B08 + 6.0 * B04 - 7.5 * B02 + 1.0)"
+
