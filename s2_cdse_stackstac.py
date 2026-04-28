@@ -25,6 +25,7 @@ from pystac_client import Client
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.errors import RasterioIOError
+from scipy.signal import savgol_filter
 import stackstac
 import xarray as xr
 
@@ -348,6 +349,9 @@ class S2Config:
     ask_credentials_in_terminal: bool
     cdse_oidc_token_url: str
     cdse_client_id: str
+    interpolate_nodata: bool
+    savgol_window: int
+    savgol_polyorder: int
 
 
 def _to_abs_path(path_text: str) -> Path:
@@ -461,6 +465,9 @@ def build_config() -> S2Config:
         ask_credentials_in_terminal=parse_bool_env("ASK_CREDENTIALS_IN_TERMINAL", True),
         cdse_oidc_token_url=os.getenv("CDSE_OIDC_TOKEN_URL", CDSE_OIDC_TOKEN_URL_DEFAULT).strip(),
         cdse_client_id=os.getenv("CDSE_CLIENT_ID", CDSE_CLIENT_ID_DEFAULT).strip(),
+        interpolate_nodata=parse_bool_env("S2_INTERPOLATE_NODATA", True),
+        savgol_window=parse_int_env("S2_SAVGOL_WINDOW", default=7, min_value=3),
+        savgol_polyorder=parse_int_env("S2_SAVGOL_POLYORDER", default=2, min_value=0),
     )
 
 
@@ -733,6 +740,49 @@ def _build_interval_multiband_stack(
     return stacked.assign_coords(band=("band", labels)).astype("float32")
 
 
+def _interpolate_and_smooth_timeseries(
+    data: xr.DataArray,
+    interpolate_nodata: bool,
+    savgol_window: int,
+    savgol_polyorder: int,
+) -> xr.DataArray:
+    if "time" not in data.dims:
+        return data
+
+    result = data
+    if interpolate_nodata:
+        result = result.interpolate_na(
+            dim="time",
+            method="linear",
+            fill_value="extrapolate",
+        )
+
+    if savgol_window <= 0:
+        return result
+
+    def _savgol_1d(values: np.ndarray) -> np.ndarray:
+        if values.shape[0] < savgol_window:
+            return values
+        if not np.any(np.isfinite(values)):
+            return values
+        return savgol_filter(
+            values,
+            window_length=savgol_window,
+            polyorder=savgol_polyorder,
+            mode="interp",
+        )
+
+    return xr.apply_ufunc(
+        _savgol_1d,
+        result,
+        input_core_dims=[["time"]],
+        output_core_dims=[["time"]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[result.dtype],
+    )
+
+
 def main() -> None:
     """Punto de entrada del flujo Sentinel-2.
 
@@ -750,6 +800,10 @@ def main() -> None:
         raise ValueError("S2_MAX_CLOUD_COVER debe estar entre 0 y 100 o ser None.")
     if config.output_resolution <= 0:
         raise ValueError("S2_OUTPUT_RESOLUTION_M debe ser > 0.")
+    if config.savgol_window % 2 == 0:
+        raise ValueError("S2_SAVGOL_WINDOW debe ser impar.")
+    if config.savgol_polyorder >= config.savgol_window:
+        raise ValueError("S2_SAVGOL_POLYORDER debe ser menor que S2_SAVGOL_WINDOW.")
 
     index_definition = _resolve_index_definition(config)
 
@@ -796,6 +850,11 @@ def main() -> None:
     print(f"Exportar compositos por intervalo: {config.export_interval_composites}")
     print(f"Exportar stack de compuestos: {config.export_composite_stack}")
     print(f"Exportar stacks por banda estilo GEE: {config.export_band_stacks}")
+    print(f"Interpolar nodata: {config.interpolate_nodata}")
+    print(
+        "Suavizado Savitzky-Golay: "
+        f"window={config.savgol_window}, polyorder={config.savgol_polyorder}"
+    )
     print(
         "Borrar compuestos intermedios tras stack: "
         f"{config.delete_interval_composites_after_stack}"
@@ -965,6 +1024,17 @@ def main() -> None:
             export_suffix = config.index_name.lower()
             report_bands = ",".join(index_definition.required_assets)
             print(f"Indice {config.index_name} calculado para todas las escenas.")
+
+        if config.interpolate_nodata or config.savgol_window > 0:
+            analysis_data = _interpolate_and_smooth_timeseries(
+                analysis_data,
+                interpolate_nodata=config.interpolate_nodata,
+                savgol_window=config.savgol_window,
+                savgol_polyorder=config.savgol_polyorder,
+            )
+            if index_definition is None:
+                stack = analysis_data
+            print("Interpolacion nodata y suavizado temporal aplicados.")
 
         config.output_dir.mkdir(parents=True, exist_ok=True)
         temporal_stack_path: Path | None = None
