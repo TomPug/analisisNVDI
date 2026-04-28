@@ -352,6 +352,7 @@ class S2Config:
     interpolate_nodata: bool
     savgol_window: int
     savgol_polyorder: int
+    reuse_existing_stacks: bool
 
 
 def _to_abs_path(path_text: str) -> Path:
@@ -468,6 +469,7 @@ def build_config() -> S2Config:
         interpolate_nodata=parse_bool_env("S2_INTERPOLATE_NODATA", True),
         savgol_window=parse_int_env("S2_SAVGOL_WINDOW", default=7, min_value=3),
         savgol_polyorder=parse_int_env("S2_SAVGOL_POLYORDER", default=2, min_value=0),
+        reuse_existing_stacks=parse_bool_env("S2_REUSE_STACKS", True),
     )
 
 
@@ -751,10 +753,13 @@ def _interpolate_and_smooth_timeseries(
 
     result = data
     if interpolate_nodata:
+        time_index = result.indexes.get("time")
+        has_duplicates = bool(time_index is not None and time_index.has_duplicates)
         result = result.interpolate_na(
             dim="time",
             method="linear",
             fill_value="extrapolate",
+            use_coordinate=not has_duplicates,
         )
 
     if savgol_window <= 0:
@@ -783,6 +788,112 @@ def _interpolate_and_smooth_timeseries(
     )
 
 
+def _parse_time_labels(labels: list[str]) -> list[np.datetime64] | None:
+    parsed: list[np.datetime64] = []
+    for label in labels:
+        candidates = [label]
+        if "_" in label:
+            candidates.append(label.split("_", 1)[0])
+        parsed_value = None
+        for candidate in candidates:
+            try:
+                parsed_value = np.datetime64(datetime.fromisoformat(candidate))
+                break
+            except ValueError:
+                continue
+        if parsed_value is None:
+            return None
+        parsed.append(parsed_value)
+    return parsed
+
+
+def _load_multiband_geotiff(path: Path) -> tuple[xr.DataArray, int | None, list[str]]:
+    with rasterio.open(path) as src:
+        values = src.read().astype("float32")
+        nodata = src.nodata
+        if nodata is not None:
+            values = np.where(values == nodata, np.nan, values)
+        transform = src.transform
+        width = src.width
+        height = src.height
+        x = transform.c + (np.arange(width) + 0.5) * transform.a
+        y = transform.f + (np.arange(height) + 0.5) * transform.e
+        labels = [desc or f"band{idx}" for idx, desc in enumerate(src.descriptions, start=1)]
+        data = xr.DataArray(
+            values,
+            coords={"band": labels, "y": y, "x": x},
+            dims=("band", "y", "x"),
+        )
+        epsg = src.crs.to_epsg() if src.crs is not None else None
+    return data, epsg, labels
+
+
+def _smooth_existing_stack_tiff(
+    path: Path,
+    config: S2Config,
+) -> None:
+    data, epsg, labels = _load_multiband_geotiff(path)
+    time_values = _parse_time_labels(labels)
+    if time_values is None:
+        time_values = [np.datetime64(idx) for idx in range(len(labels))]
+
+    series = data.rename({"band": "time"}).assign_coords(time=("time", time_values))
+    smoothed = _interpolate_and_smooth_timeseries(
+        series,
+        interpolate_nodata=config.interpolate_nodata,
+        savgol_window=config.savgol_window,
+        savgol_polyorder=config.savgol_polyorder,
+    )
+    restored = smoothed.rename({"time": "band"}).assign_coords(band=("band", labels))
+
+    output_epsg = epsg or config.output_epsg
+    if output_epsg is None:
+        raise RuntimeError(
+            f"No se pudo inferir EPSG para reescribir {path}. "
+            "Define S2_OUTPUT_EPSG en .env."
+        )
+    write_multiband_geotiff(
+        output_tiff=path,
+        data=restored,
+        output_epsg=output_epsg,
+        compress=config.tiff_compress,
+    )
+
+
+def _process_existing_stacks(config: S2Config, analysis_token: str) -> bool:
+    processed = False
+    if config.export_temporal_stack:
+        temporal_path = _build_temporal_stack_path(
+            output_dir=config.output_dir,
+            output_prefix=config.output_prefix,
+            token=analysis_token,
+        )
+        if temporal_path.exists():
+            print(f"Reutilizando stack temporal existente: {temporal_path}")
+            _smooth_existing_stack_tiff(temporal_path, config)
+            processed = True
+
+    if config.export_band_stacks and analysis_token == "bands":
+        candidate_bands = _dedupe_keep_order(
+            list(config.requested_assets)
+            + list(GEE_STYLE_EXPORT_BANDS)
+            + list(TASSELED_CAP_SOURCE_BANDS)
+        )
+        for band_name in candidate_bands:
+            band_path = _build_temporal_stack_path(
+                output_dir=config.output_dir,
+                output_prefix=config.output_prefix,
+                token=band_name,
+            )
+            if not band_path.exists():
+                continue
+            print(f"Reutilizando stack por banda existente: {band_path}")
+            _smooth_existing_stack_tiff(band_path, config)
+            processed = True
+
+    return processed
+
+
 def main() -> None:
     """Punto de entrada del flujo Sentinel-2.
 
@@ -806,6 +917,7 @@ def main() -> None:
         raise ValueError("S2_SAVGOL_POLYORDER debe ser menor que S2_SAVGOL_WINDOW.")
 
     index_definition = _resolve_index_definition(config)
+    analysis_token = "bands" if index_definition is None else config.index_name
 
     access_token = get_cdse_access_token(
         access_token=config.cdse_access_token,
@@ -855,6 +967,12 @@ def main() -> None:
         "Suavizado Savitzky-Golay: "
         f"window={config.savgol_window}, polyorder={config.savgol_polyorder}"
     )
+    print(f"Reutilizar stacks existentes: {config.reuse_existing_stacks}")
+
+    if config.reuse_existing_stacks and (config.interpolate_nodata or config.savgol_window > 0):
+        if _process_existing_stacks(config, analysis_token):
+            print("Proceso completado usando stacks existentes.")
+            return
     print(
         "Borrar compuestos intermedios tras stack: "
         f"{config.delete_interval_composites_after_stack}"
