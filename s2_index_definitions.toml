@@ -22,3 +22,15 @@ clip_range = [-1.0, 1.0]
 required_assets = ["B08", "B04", "B02"]
 formula = "safe_div(2.5 * (B08 - B04), B08 + 6.0 * B04 - 7.5 * B02 + 1.0)"
 
+[indices.TCB]
+required_assets = ["B02", "B03", "B04", "B08", "B11", "B12"]
+formula = "0.3510 * B02 + 0.3813 * B03 + 0.3437 * B04 + 0.7196 * B08 + 0.2396 * B11 + 0.1949 * B12"
+
+[indices.TCG]
+required_assets = ["B02", "B03", "B04", "B08", "B11", "B12"]
+formula = "-0.3599 * B02 - 0.3533 * B03 - 0.4734 * B04 + 0.6633 * B08 + 0.0087 * B11 - 0.2856 * B12"
+
+[indices.TCW]
+required_assets = ["B02", "B03", "B04", "B08", "B11", "B12"]
+formula = "0.2578 * B02 + 0.2305 * B03 + 0.0883 * B04 + 0.1071 * B08 - 0.7611 * B11 - 0.5308 * B12"
+

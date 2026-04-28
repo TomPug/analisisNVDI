@@ -65,6 +65,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ENV_PATH = SCRIPT_DIR / ".env"
 DEFAULT_INDEX_DEFINITIONS_PATH = SCRIPT_DIR / "s2_index_definitions.toml"
 DEFAULT_SCL_MASK_VALUES = (3, 8, 9, 10, 11)
+GEE_STYLE_EXPORT_BANDS = ("B02", "B03", "B04", "B05", "B06", "B07", "B8A", "B11", "B12")
+TASSELED_CAP_SOURCE_BANDS = ("B02", "B03", "B04", "B08", "B11", "B12")
 
 
 @dataclass(frozen=True)
@@ -322,6 +324,7 @@ class S2Config:
     export_interval_composites: bool
     export_temporal_stack: bool
     export_composite_stack: bool
+    export_band_stacks: bool
     delete_interval_composites_after_stack: bool
     output_epsg: int | None
     output_resolution: float
@@ -427,6 +430,7 @@ def build_config() -> S2Config:
         export_interval_composites=parse_bool_env("S2_EXPORT_INTERVAL_COMPOSITES", True),
         export_temporal_stack=parse_bool_env("S2_EXPORT_TEMPORAL_STACK", True),
         export_composite_stack=parse_bool_env("S2_EXPORT_COMPOSITE_STACK", True),
+        export_band_stacks=parse_bool_env("S2_EXPORT_BAND_STACKS", True),
         delete_interval_composites_after_stack=parse_bool_env(
             "S2_DELETE_INTERVAL_COMPOSITES_AFTER_STACK",
             True,
@@ -664,6 +668,71 @@ def _to_temporal_multiband(data: xr.DataArray) -> xr.DataArray:
     return stacked.assign_coords(band=("band", labels))
 
 
+def _compute_tasseled_cap_series(stack: xr.DataArray) -> dict[str, xr.DataArray]:
+    missing = [band for band in TASSELED_CAP_SOURCE_BANDS if band not in set(stack["band"].values)]
+    if missing:
+        raise RuntimeError(
+            "No se pueden calcular TCB/TCG/TCW porque faltan bandas de entrada: "
+            f"{', '.join(missing)}"
+        )
+
+    b02 = stack.sel(band="B02").astype("float32")
+    b03 = stack.sel(band="B03").astype("float32")
+    b04 = stack.sel(band="B04").astype("float32")
+    b08 = stack.sel(band="B08").astype("float32")
+    b11 = stack.sel(band="B11").astype("float32")
+    b12 = stack.sel(band="B12").astype("float32")
+
+    tcb = (
+        b02 * 0.3510
+        + b03 * 0.3813
+        + b04 * 0.3437
+        + b08 * 0.7196
+        + b11 * 0.2396
+        + b12 * 0.1949
+    ).astype("float32")
+    tcg = (
+        b02 * -0.3599
+        + b03 * -0.3533
+        + b04 * -0.4734
+        + b08 * 0.6633
+        + b11 * 0.0087
+        + b12 * -0.2856
+    ).astype("float32")
+    tcw = (
+        b02 * 0.2578
+        + b03 * 0.2305
+        + b04 * 0.0883
+        + b08 * 0.1071
+        + b11 * -0.7611
+        + b12 * -0.5308
+    ).astype("float32")
+    return {"TCB": tcb, "TCG": tcg, "TCW": tcw}
+
+
+def _build_interval_multiband_stack(
+    data: xr.DataArray,
+    intervals: list[tuple[datetime, datetime]],
+    composite_method: str,
+) -> xr.DataArray | None:
+    composites: list[xr.DataArray] = []
+    labels: list[str] = []
+
+    for start, end in intervals:
+        window = select_time_window(data, start, end)
+        if window is None:
+            continue
+        composite = reduce_time_window(window, composite_method)
+        composites.append(composite)
+        labels.append(f"{start.strftime('%Y-%m-%d')}_{(end - timedelta(days=1)).strftime('%Y-%m-%d')}")
+
+    if not composites:
+        return None
+
+    stacked = xr.concat(composites, dim="band")
+    return stacked.assign_coords(band=("band", labels)).astype("float32")
+
+
 def main() -> None:
     """Punto de entrada del flujo Sentinel-2.
 
@@ -707,6 +776,10 @@ def main() -> None:
     else:
         print(f"Bandas del indice: {list(index_definition.required_assets)}")
         print(f"Formula indice: {index_definition.formula}")
+        if config.export_band_stacks:
+            print(
+                "Aviso: S2_EXPORT_BAND_STACKS solo se aplica cuando S2_INDEX_NAME=NONE."
+            )
     print(f"Aplicar mascara de nubes: {config.apply_cloud_mask}")
     if config.apply_cloud_mask:
         print(
@@ -722,6 +795,7 @@ def main() -> None:
     print(f"Exportar stack temporal: {config.export_temporal_stack}")
     print(f"Exportar compositos por intervalo: {config.export_interval_composites}")
     print(f"Exportar stack de compuestos: {config.export_composite_stack}")
+    print(f"Exportar stacks por banda estilo GEE: {config.export_band_stacks}")
     print(
         "Borrar compuestos intermedios tras stack: "
         f"{config.delete_interval_composites_after_stack}"
@@ -763,6 +837,12 @@ def main() -> None:
 
     prepared_items = [normalize_item_s3(item) for item in items]
     processing_assets = _resolve_processing_assets(config, index_definition)
+    if config.export_band_stacks and index_definition is None:
+        processing_assets = _dedupe_keep_order(
+            list(processing_assets)
+            + list(GEE_STYLE_EXPORT_BANDS)
+            + list(TASSELED_CAP_SOURCE_BANDS)
+        )
     asset_mapping = resolve_requested_assets(prepared_items, processing_assets)
     asset_key_by_name = {name: asset_mapping[name] for name in processing_assets}
     print(f"Assets logicos: {processing_assets}")
@@ -909,6 +989,41 @@ def main() -> None:
         interval_tokens: list[str] = []
         intervals = build_intervals(config.start_date, config.end_date, config.interval_days)
         print(f"Intervalos temporales: {len(intervals)}")
+
+        if config.export_band_stacks and index_definition is None:
+            tasseled_cap_series = _compute_tasseled_cap_series(stack)
+            band_series: dict[str, xr.DataArray] = {
+                band_name: stack.sel(band=band_name).astype("float32")
+                for band_name in data_assets
+            }
+            band_series.update(tasseled_cap_series)
+
+            exported_band_paths: list[Path] = []
+            for band_name, series in band_series.items():
+                band_stack = _build_interval_multiband_stack(
+                    data=series,
+                    intervals=intervals,
+                    composite_method=config.composite_method,
+                )
+                if band_stack is None:
+                    continue
+
+                output_tiff = _build_temporal_stack_path(
+                    output_dir=config.output_dir,
+                    output_prefix=config.output_prefix,
+                    token=band_name,
+                )
+                write_multiband_geotiff(
+                    output_tiff=output_tiff,
+                    data=band_stack,
+                    output_epsg=output_epsg,
+                    compress=config.tiff_compress,
+                )
+                exported_band_paths.append(output_tiff)
+                print(f"Stack por banda exportado: {output_tiff.resolve()}")
+
+            if exported_band_paths:
+                print(f"Bandas exportadas en modo GEE: {len(exported_band_paths)}")
 
         if config.export_interval_composites:
             for idx, (start, end) in enumerate(intervals, start=1):

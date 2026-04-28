@@ -325,13 +325,13 @@ def get_cdse_access_token(
 
 
 def load_aoi_info(vector_path: Path, layer: str | None = None) -> AOIInfo:
-    """Carga y valida un AOI desde SHP/GPKG.
+    """Carga y valida un AOI desde SHP/GPKG/GeoJSON.
 
     Ademas de leer geometrias validas, reproyecta temporalmente a EPSG:4326 para
     calcular la caja minima en lat/lon (util para consultas STAC por ``bbox``).
 
     Args:
-        vector_path: Ruta al archivo vectorial (.shp o .gpkg).
+        vector_path: Ruta al archivo vectorial (.shp, .gpkg, .geojson o .json).
         layer: Capa opcional (especialmente util para geopackage).
 
     Returns:
@@ -344,8 +344,8 @@ def load_aoi_info(vector_path: Path, layer: str | None = None) -> AOIInfo:
     """
     if not vector_path.exists():
         raise FileNotFoundError(f"AOI no existe: {vector_path}")
-    if vector_path.suffix.lower() not in {".shp", ".gpkg"}:
-        raise ValueError("AOI debe ser .shp o .gpkg.")
+    if vector_path.suffix.lower() not in {".shp", ".gpkg", ".geojson", ".json"}:
+        raise ValueError("AOI debe ser .shp, .gpkg, .geojson o .json.")
 
     read_kwargs: dict[str, Any] = {}
     if layer:
@@ -391,34 +391,59 @@ def _api_error_status(err: APIError) -> int | None:
     return getattr(response, "status_code", None)
 
 
-def search_items_with_retry(
+def _is_temporary_stac_error(status: int | None, message: str) -> bool:
+    """Determina si un error STAC es temporal y conviene reintentar.
+
+    Considera como temporales:
+    - HTTP 429 y 5xx comunes de gateway/backend.
+    - Timeouts.
+    - Errores transitorios de DNS/conectividad de red.
+    """
+    msg = message.lower()
+    if status in {429, 500, 502, 503, 504}:
+        return True
+
+    transient_tokens = (
+        "gateway time-out",
+        "timed out",
+        "max retries exceeded",
+        "connectionerror",
+        "name resolution",
+        "nameresolutionerror",
+        "failed to resolve",
+        "temporary failure in name resolution",
+        "getaddrinfo failed",
+        "connection reset",
+        "connection aborted",
+    )
+    return any(token in msg for token in transient_tokens)
+
+
+def _is_recovery_conflict_error(message: str) -> bool:
+    """Detecta errores del backend PostgreSQL de CDSE recuperables por particion.
+
+    Este error suele aparecer en consultas amplias y se mitiga dividiendo el
+    rango temporal en ventanas mas pequenas.
+    """
+    msg = message.lower()
+    tokens = (
+        "serializationerror",
+        "conflict with recovery",
+        "canceling statement due to conflict with recovery",
+    )
+    return any(token in msg for token in tokens)
+
+
+def _search_window_with_retry(
     catalog: Client,
     collections: list[str],
     start_date: str,
     end_date: str,
     bbox_latlon: tuple[float, float, float, float],
     max_items: int,
-    retries: int = 4,
+    retries: int,
 ) -> list:
-    """Ejecuta una busqueda STAC con reintentos para errores temporales.
-
-    Reintenta con backoff exponencial ante 502/503/504 o timeouts de gateway.
-
-    Args:
-        catalog: Cliente STAC abierto.
-        collections: Colecciones STAC a consultar.
-        start_date: Fecha inicial ``YYYY-MM-DD``.
-        end_date: Fecha final ``YYYY-MM-DD``.
-        bbox_latlon: BBOX en EPSG:4326.
-        max_items: Maximo total de items a recuperar.
-        retries: Numero maximo de intentos.
-
-    Returns:
-        Lista de items STAC.
-
-    Raises:
-        APIError: Si falla con error no temporal o se agotan reintentos.
-    """
+    """Ejecuta una busqueda STAC para una ventana temporal con reintentos."""
     delay = 2.0
     last_error = None
 
@@ -436,11 +461,7 @@ def search_items_with_retry(
         except APIError as err:
             status = _api_error_status(err)
             message = str(err)
-            temporary = (
-                status in {502, 503, 504}
-                or "Gateway Time-out" in message
-                or "timed out" in message.lower()
-            )
+            temporary = _is_temporary_stac_error(status, message)
             last_error = err
             if not temporary or attempt == retries:
                 raise
@@ -454,6 +475,115 @@ def search_items_with_retry(
     if last_error is not None:
         raise last_error
     return []
+
+
+def _build_time_windows(
+    start_date: str,
+    end_date: str,
+    max_window_days: int,
+) -> list[tuple[str, str]]:
+    """Divide un rango de fechas en ventanas inclusivas de tamano acotado."""
+    dt_start = datetime.strptime(start_date, "%Y-%m-%d")
+    dt_end = datetime.strptime(end_date, "%Y-%m-%d")
+    if dt_start > dt_end:
+        return []
+
+    windows: list[tuple[str, str]] = []
+    cursor = dt_start
+    while cursor <= dt_end:
+        win_end = min(cursor + timedelta(days=max_window_days - 1), dt_end)
+        windows.append((cursor.strftime("%Y-%m-%d"), win_end.strftime("%Y-%m-%d")))
+        cursor = win_end + timedelta(days=1)
+    return windows
+
+
+def search_items_with_retry(
+    catalog: Client,
+    collections: list[str],
+    start_date: str,
+    end_date: str,
+    bbox_latlon: tuple[float, float, float, float],
+    max_items: int,
+    retries: int = 6,
+) -> list:
+    """Ejecuta una busqueda STAC con reintentos para errores temporales.
+
+    Reintenta con backoff exponencial ante errores HTTP temporales,
+    timeouts y problemas puntuales de DNS/conectividad.
+
+    Args:
+        catalog: Cliente STAC abierto.
+        collections: Colecciones STAC a consultar.
+        start_date: Fecha inicial ``YYYY-MM-DD``.
+        end_date: Fecha final ``YYYY-MM-DD``.
+        bbox_latlon: BBOX en EPSG:4326.
+        max_items: Maximo total de items a recuperar.
+        retries: Numero maximo de intentos.
+
+    Returns:
+        Lista de items STAC.
+
+    Raises:
+        APIError: Si falla con error no temporal o se agotan reintentos.
+    """
+    chunk_days = parse_int_env("STAC_SEARCH_CHUNK_DAYS", default=365, min_value=1)
+    windows = _build_time_windows(start_date, end_date, chunk_days)
+    if len(windows) > 1:
+        print(
+            "Busqueda STAC por ventanas temporales: "
+            f"{len(windows)} ventanas de hasta {chunk_days} dias."
+        )
+
+    items_by_id: dict[str, Any] = {}
+
+    while windows:
+        win_start, win_end = windows.pop(0)
+        try:
+            win_items = _search_window_with_retry(
+                catalog=catalog,
+                collections=collections,
+                start_date=win_start,
+                end_date=win_end,
+                bbox_latlon=bbox_latlon,
+                max_items=max_items,
+                retries=retries,
+            )
+            for item in win_items:
+                item_id = getattr(item, "id", None)
+                if not isinstance(item_id, str) or not item_id.strip():
+                    item_id = str(item)
+                if item_id not in items_by_id:
+                    items_by_id[item_id] = item
+        except APIError as err:
+            message = str(err)
+            if not _is_recovery_conflict_error(message):
+                raise
+
+            dt_start = datetime.strptime(win_start, "%Y-%m-%d")
+            dt_end = datetime.strptime(win_end, "%Y-%m-%d")
+            if dt_start >= dt_end:
+                raise
+
+            half_days = (dt_end - dt_start).days // 2
+            if half_days < 1:
+                raise
+
+            mid = dt_start + timedelta(days=half_days)
+            left_start = dt_start.strftime("%Y-%m-%d")
+            left_end = mid.strftime("%Y-%m-%d")
+            right_start = (mid + timedelta(days=1)).strftime("%Y-%m-%d")
+            right_end = dt_end.strftime("%Y-%m-%d")
+
+            print(
+                "STAC devolvio SerializationError; dividiendo rango temporal en "
+                f"{left_start}/{left_end} y {right_start}/{right_end}."
+            )
+
+            # Se procesa primero la ventana izquierda para conservar orden temporal.
+            windows.insert(0, (right_start, right_end))
+            windows.insert(0, (left_start, left_end))
+
+    return list(items_by_id.values())
 
 
 def get_cloud_cover(item: Any) -> float:

@@ -74,9 +74,34 @@ Variables nuevas relevantes para S2:
 - `S2_MAX_CLOUD_COVER=None` (recomendado si ya usas mascara SCL por pixel)
 - `S2_EXPORT_TEMPORAL_STACK=true`
 - `S2_EXPORT_COMPOSITE_STACK=true`
+- `S2_EXPORT_BAND_STACKS=true` para exportar un TIFF temporal por banda, similar al flujo de `s2_img_gee.py`
 - `S2_DELETE_INTERVAL_COMPOSITES_AFTER_STACK=true` (borra TIFF intermedios de intervalo y deja los 2 stacks)
 - `S2_LOCAL_ASSET_CACHE=false` (modo S3 directo recomendado)
 - `S2_CLEANUP_INTERMEDIATE_FILES=true`
+
+Si quieres replicar lo mas parecido posible al script de Earth Engine, usa:
+
+```bash
+S2_INDEX_NAME=NONE
+S2_EXPORT_BAND_STACKS=true
+S2_BANDS=B02,B03,B04,B05,B06,B07,B8A,B11,B12
+```
+
+Para tu caso (serie temporal por banda 2018-2025 con mascara de nubes):
+
+```bash
+AOI_VECTOR_PATH="G:/Unidades compartidas/Proy_ATTEL/DI_Tomas/RIOJA-FENOLOGIA/data/raw/mup141_buffered.shp"
+START_DATE=2018-01-01
+END_DATE=2025-12-31
+S2_INDEX_NAME=NONE
+S2_EXPORT_BAND_STACKS=true
+S2_BANDS=B02,B03,B04,B05,B06,B07,B8A,B11,B12
+S2_APPLY_CLOUD_MASK=true
+S2_CLOUD_MASK_ASSET=SCL
+S2_CLOUD_MASK_SCL_CLASSES=3,8,9,10,11
+```
+
+Tambien puedes calcular Tasseled Cap como indice independiente con `S2_INDEX_NAME=TCB`, `TCG` o `TCW`.
 
 Definiciones de indices en archivo externo (`s2_index_definitions.toml`):
 
@@ -93,3 +118,15 @@ Variables comunes para modo S3 directo (S1/S2):
 - `AWS_SECRET_ACCESS_KEY=...`
 - `STACKSTAC_DASK_WORKERS=4`
 - `STACKSTAC_LOCAL_ASSET_CACHE=false`
+
+Si ves errores de red como `Failed to resolve stac.dataspace.copernicus.eu`, el script ahora reintenta automaticamente. Si persiste, prueba:
+
+```bash
+nslookup stac.dataspace.copernicus.eu
+```
+
+Y como mitigacion temporal en Windows (PowerShell):
+
+```powershell
+ipconfig /flushdns
+```
